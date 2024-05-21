@@ -91,6 +91,8 @@ impl<State> Future for Scoped<State> {
             _ = this.key.take();
         }
 
+        this.handles.clear();
+
         // SAFETY: this is no longer aliased
         let mut unaliased = unsafe {
             this.aliased
