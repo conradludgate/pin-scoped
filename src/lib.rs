@@ -1,5 +1,3 @@
-#![cfg_attr(feature = "async_fn_traits", feature(async_fn_traits, async_closure))]
-
 use futures_util::{task::AtomicWaker, Future};
 use parking_lot_core::{ParkResult, ParkToken, UnparkToken};
 use pin_project::{pin_project, pinned_drop};
@@ -199,47 +197,14 @@ impl<State: 'static, F: Future> Future for ScopedFuture<State, F> {
 pub trait Captures<U> {}
 impl<T: ?Sized, U> Captures<U> for T {}
 
-// pub trait AsyncFnOnce<S>:
-//     FnOnce(S) -> Self::Future + 'static
-// {
-//     type Future: Future<Output = Self::Output> + Captures<S> + Send;
-//     type Output;
-// }
-
-// impl<F, Fut, S> AsyncFnOnce<S> for F where
-//     F: FnOnce(S) -> Self::Future + 'static,
-//     Fut: Future + 'static,
-// {
-//     type Future = Fut;
-//     type Output = Fut::Output;
-// }
-// pub trait MyAsyncFnOnce<'state, S: 'static>:
-//     AsyncFnOnce(&'state S) -> Self::OutputVal + 'static
-// where
-//     Self::CallOnceFuture: Captures<&'state S> + Send,
-// {
-//     type Future: Captures<&'state S> + Send;
-//     type OutputVal: Send + 'static;
-// }
-
-// impl<'state, F: ?Sized, Fut, S: 'static> MyAsyncFnOnce<'state, S> for F
-// where
-//     F: AsyncFnOnce(&'state S) -> Fut + 'static,
-//     Fut: Future + Send + Captures<&'state S> + 'fut,
-// {
-//     type Future = Fut;
-//     type Output = Fut::Output;
-// }
-
 pub trait AsyncFnOnceRef<'state, S: 'static, R: Send + 'static>: 'static {
     fn call(self, state: &'state S) -> impl Future<Output = R> + Captures<&'state S> + Send;
 }
 
-#[cfg(feature = "async_fn_traits")]
-impl<'state, S: 'static, F, R: Send + 'static> AsyncFnOnceRef<'state, S, R> for F
+impl<'state, S: 'static, F, Fut, R: Send + 'static> AsyncFnOnceRef<'state, S, R> for F
 where
-    F: std::ops::AsyncFnOnce(&'state S) -> R + 'static,
-    F::CallOnceFuture: Send + Captures<&'state S>,
+    F: std::ops::FnOnce(&'state S) -> Fut + 'static,
+    Fut: Future<Output = R> + Send + Captures<&'state S>,
 {
     fn call(self, state: &'state S) -> impl Future<Output = R> + Captures<&'state S> + Send {
         (self)(state)
@@ -257,34 +222,18 @@ mod tests {
 
     async fn run(n: u64) -> u64 {
         let mut scoped = pin!(Scoped::new(Mutex::new(0)));
+        struct Ex(u64);
+        impl<'state> super::AsyncFnOnceRef<'state, Mutex<u64>, ()> for Ex {
+            async fn call(self, state: &'state Mutex<u64>) {
+                let i = self.0;
+                tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
+                *state.lock().unwrap() += 1;
+                tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
+            }
+        }
 
         for i in 0..n {
-            #[cfg(feature = "async_fn_traits")]
-            macro_rules! task {
-                () => {
-                    async move |state: &Mutex<u64>| {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
-                        *state.lock().unwrap() += 1;
-                        tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
-                    }
-                };
-            }
-            #[cfg(not(feature = "async_fn_traits"))]
-            macro_rules! task {
-                () => {{
-                    struct Ex(u64);
-                    impl<'state> super::AsyncFnOnceRef<'state, Mutex<u64>, ()> for Ex {
-                        async fn call(self, state: &'state Mutex<u64>) {
-                            let i = self.0;
-                            tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
-                            *state.lock().unwrap() += 1;
-                            tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
-                        }
-                    }
-                    Ex(i)
-                }};
-            }
-            scoped.as_mut().spawn(task!());
+            scoped.as_mut().spawn(Ex(i));
         }
 
         scoped.await.into_inner().unwrap()
