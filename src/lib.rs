@@ -26,14 +26,19 @@ impl<State: 'static> PinnedDrop for Scoped<State> {
     #[inline(never)]
     fn drop(self: Pin<&mut Self>) {
         let this = self.project();
-        for handle in this.handles.drain(..) {
-            handle.abort();
-        }
+
         let Some(key) = this.key else {
             // scope handle was consumed
             return;
         };
 
+        for handle in this.handles.drain(..) {
+            handle.abort();
+        }
+
+        // avoid touching aliasable, go through key pointer instead
+        // SAFETY: key was initiated from `AtomicUsize::to_ptr`.
+        // the allocation it points to is owned by self, and is therefore still valid
         let tasks = unsafe { AtomicUsize::from_ptr(key.get() as *mut usize) };
         if tasks.load(Ordering::Acquire) > 0 {
             // SAFETY:
@@ -123,8 +128,8 @@ impl<State: 'static + Sync> Scoped<State> {
             .as_pin_mut()
             .expect("aliased state must be set while scoped is alive");
 
-        let addr =
-            unsafe { NonZeroUsize::new_unchecked(aliased.as_ref().get().tasks.as_ptr() as usize) };
+        let addr = NonZeroUsize::new(aliased.as_ref().get().tasks.as_ptr() as usize)
+            .expect("refs should never be null");
         if let Some(old_addr) = this.key.replace(addr) {
             if old_addr != addr {
                 abort()
@@ -258,7 +263,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn dropped() {
         let mut task = pin!(run(64));
-        assert!(task.as_mut().poll(&mut Context::from_waker(noop_waker_ref())).is_pending());
+        assert!(task
+            .as_mut()
+            .poll(&mut Context::from_waker(noop_waker_ref()))
+            .is_pending());
         yield_now().await;
     }
 }
