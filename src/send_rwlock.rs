@@ -48,7 +48,6 @@ const READERS_MASK: usize = !0b111;
 const ONE_READER: usize = 0b1000;
 
 // Token indicating what type of lock a queued thread is trying to acquire
-const TOKEN_SHARED: ParkToken = ParkToken(ONE_READER);
 const TOKEN_EXCLUSIVE: ParkToken = ParkToken(WRITER_BIT);
 
 /// Raw reader-writer lock type backed by the parking lot.
@@ -83,26 +82,6 @@ impl RawRwLock {
     }
 
     #[inline]
-    pub unsafe fn unlock_exclusive(&self) {
-        if self
-            .state
-            .compare_exchange(WRITER_BIT, 0, Ordering::Release, Ordering::Relaxed)
-            .is_ok()
-        {
-            return;
-        }
-        self.unlock_exclusive_slow(false);
-    }
-
-    #[inline]
-    pub fn lock_shared(&self) {
-        if !self.try_lock_shared_fast(false) {
-            let result = self.lock_shared_slow(false);
-            debug_assert!(result);
-        }
-    }
-
-    #[inline]
     pub fn try_lock_shared(&self) -> bool {
         if self.try_lock_shared_fast(false) {
             true
@@ -117,18 +96,6 @@ impl RawRwLock {
         if state & (READERS_MASK | WRITER_PARKED_BIT) == (ONE_READER | WRITER_PARKED_BIT) {
             self.unlock_shared_slow();
         }
-    }
-
-    #[inline]
-    pub fn is_locked(&self) -> bool {
-        let state = self.state.load(Ordering::Relaxed);
-        state & (WRITER_BIT | READERS_MASK) != 0
-    }
-
-    #[inline]
-    pub fn is_locked_exclusive(&self) -> bool {
-        let state = self.state.load(Ordering::Relaxed);
-        state & (WRITER_BIT) != 0
     }
 }
 
@@ -211,72 +178,6 @@ impl RawRwLock {
 
         // Step 2: wait for all remaining readers to exit the lock.
         self.wait_for_readers(0)
-    }
-
-    #[cold]
-    fn unlock_exclusive_slow(&self, force_fair: bool) {
-        // There are threads to unpark. Try to unpark as many as we can.
-        let callback = |mut new_state, result: UnparkResult| {
-            // If we are using a fair unlock then we should keep the
-            // rwlock locked and hand it off to the unparked threads.
-            if result.unparked_threads != 0 && (force_fair || result.be_fair) {
-                if result.have_more_threads {
-                    new_state |= PARKED_BIT;
-                }
-                self.state.store(new_state, Ordering::Release);
-                TOKEN_HANDOFF
-            } else {
-                // Clear the parked bit if there are no more parked threads.
-                if result.have_more_threads {
-                    self.state.store(PARKED_BIT, Ordering::Release);
-                } else {
-                    self.state.store(0, Ordering::Release);
-                }
-                TOKEN_NORMAL
-            }
-        };
-        // SAFETY: `callback` does not panic or call into any function of `parking_lot`.
-        unsafe {
-            self.wake_parked_threads(0, callback);
-        }
-    }
-
-    #[cold]
-    fn lock_shared_slow(&self, recursive: bool) -> bool {
-        let try_lock = |state: &mut usize| {
-            let mut spinwait_shared = SpinWait::new();
-            loop {
-                // This is the same condition as try_lock_shared_fast
-                #[allow(clippy::collapsible_if)]
-                if *state & WRITER_BIT != 0 {
-                    if !recursive || *state & READERS_MASK == 0 {
-                        return false;
-                    }
-                }
-
-                if self
-                    .state
-                    .compare_exchange_weak(
-                        *state,
-                        state
-                            .checked_add(ONE_READER)
-                            .expect("RwLock reader count overflow"),
-                        Ordering::Acquire,
-                        Ordering::Relaxed,
-                    )
-                    .is_ok()
-                {
-                    return true;
-                }
-
-                // If there is high contention on the reader count then we want
-                // to leave some time between attempts to acquire the lock to
-                // let other threads make progress.
-                spinwait_shared.spin_no_yield();
-                *state = self.state.load(Ordering::Relaxed);
-            }
-        };
-        self.lock_common(TOKEN_SHARED, try_lock, WRITER_BIT)
     }
 
     #[cold]

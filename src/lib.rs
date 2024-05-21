@@ -2,7 +2,7 @@ use futures_util::{task::AtomicWaker, Future};
 use pin_project_lite::pin_project;
 use pinned_aliasable::Aliasable;
 use send_rwlock::RawRwLock;
-use std::{cell::UnsafeCell, pin::Pin};
+use std::{cell::UnsafeCell, mem::ManuallyDrop, pin::Pin};
 use tokio::task::{AbortHandle, JoinHandle};
 
 mod send_rwlock;
@@ -19,8 +19,13 @@ pin_project! {
         #[inline(never)]
         fn drop(this: Pin<&mut Self>) {
             let this = this.project();
+            let aliased = this.aliased.as_ref().get();
 
             if this.handles.is_empty() {
+                // lock and drop the state, if it's not already locked
+                if aliased.raw_lock.try_lock_exclusive() {
+                    unsafe { ManuallyDrop::drop(&mut *aliased.state.get()) };
+                }
                 return;
             }
 
@@ -28,25 +33,16 @@ pin_project! {
                 handle.abort();
             }
 
-            let state = {
-                let aliased = this.aliased.as_ref().get();
-
-                aliased.raw_lock.lock_exclusive();
-
-                let res = unsafe { &mut *aliased.state.get() }.take().unwrap();
-                unsafe { aliased.raw_lock.unlock_exclusive() };
-                res
-            };
-
-            drop(state);
-
+            // lock and drop the state.
+            aliased.raw_lock.lock_exclusive();
+            unsafe { ManuallyDrop::drop(&mut *aliased.state.get()) };
         }
     }
 }
 
 struct SharedState<State> {
     raw_lock: RawRwLock,
-    state: UnsafeCell<Option<State>>,
+    state: UnsafeCell<ManuallyDrop<State>>,
     waker: AtomicWaker,
 }
 
@@ -65,9 +61,8 @@ impl<State> Future for Scoped<State> {
                 return std::task::Poll::Pending;
             }
 
-            let res = unsafe { &mut *aliased.state.get() }.take().unwrap();
-            unsafe { aliased.raw_lock.unlock_exclusive() };
-            res
+            // take the state now it's locked
+            unsafe { ManuallyDrop::take(&mut *aliased.state.get()) }
         };
 
         this.handles.clear();
@@ -81,7 +76,7 @@ impl<State: 'static + Sync> Scoped<State> {
         Scoped {
             handles: vec![],
             aliased: Aliasable::new(SharedState {
-                state: UnsafeCell::new(Some(state)),
+                state: UnsafeCell::new(ManuallyDrop::new(state)),
                 waker: AtomicWaker::new(),
                 raw_lock: RawRwLock::new(),
             }),
@@ -107,7 +102,7 @@ impl<State: 'static + Sync> Scoped<State> {
             "spawn should not be called after polling the Scoped handle"
         );
 
-        let future = f.call(unsafe { &*state.state.get() }.as_ref().unwrap());
+        let future = f.call(unsafe { &*state.state.get() });
         let task = tokio::task::spawn(ScopedFuture {
             raw_lock: &state.raw_lock,
             waker: &state.waker,
