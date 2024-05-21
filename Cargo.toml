@@ -3,6 +3,9 @@ name = "pin-scoped"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+async_fn_traits = []
+
 [dependencies]
 futures-util = "0.3.30"
 parking_lot_core = "0.9.10"

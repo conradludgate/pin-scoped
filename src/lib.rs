@@ -1,4 +1,4 @@
-#![feature(async_fn_traits)]
+#![cfg_attr(feature = "async_fn_traits", feature(async_fn_traits, async_closure))]
 
 use futures_util::{task::AtomicWaker, Future};
 use parking_lot_core::{ParkResult, ParkToken, UnparkToken};
@@ -6,7 +6,6 @@ use pin_project::{pin_project, pinned_drop};
 use pinned_aliasable::Aliasable;
 use std::{
     num::NonZeroUsize,
-    ops::AsyncFnOnce,
     pin::Pin,
     process::abort,
     sync::atomic::{AtomicUsize, Ordering},
@@ -236,9 +235,10 @@ pub trait AsyncFnOnceRef<'state, S: 'static, R: Send + 'static>: 'static {
     fn call(self, state: &'state S) -> impl Future<Output = R> + Captures<&'state S> + Send;
 }
 
+#[cfg(feature = "async_fn_traits")]
 impl<'state, S: 'static, F, R: Send + 'static> AsyncFnOnceRef<'state, S, R> for F
 where
-    F: AsyncFnOnce(&'state S) -> R + 'static,
+    F: std::ops::AsyncFnOnce(&'state S) -> R + 'static,
     F::CallOnceFuture: Send + Captures<&'state S>,
 {
     fn call(self, state: &'state S) -> impl Future<Output = R> + Captures<&'state S> + Send {
@@ -253,23 +253,38 @@ mod tests {
     use futures_util::{task::noop_waker_ref, Future};
     use tokio::task::yield_now;
 
-    use crate::{AsyncFnOnceRef, Scoped};
+    use crate::Scoped;
 
     async fn run(n: u64) -> u64 {
         let mut scoped = pin!(Scoped::new(Mutex::new(0)));
 
-        struct Ex(u64);
-        impl<'state> AsyncFnOnceRef<'state, Mutex<u64>, ()> for Ex {
-            async fn call(self, state: &'state Mutex<u64>) {
-                let i = self.0;
-                tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
-                *state.lock().unwrap() += 1;
-                tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
-            }
-        }
-
         for i in 0..n {
-            scoped.as_mut().spawn(Ex(i));
+            #[cfg(feature = "async_fn_traits")]
+            macro_rules! task {
+                () => {
+                    async move |state: &Mutex<u64>| {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
+                        *state.lock().unwrap() += 1;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
+                    }
+                };
+            }
+            #[cfg(not(feature = "async_fn_traits"))]
+            macro_rules! task {
+                () => {{
+                    struct Ex(u64);
+                    impl<'state> super::AsyncFnOnceRef<'state, Mutex<u64>, ()> for Ex {
+                        async fn call(self, state: &'state Mutex<u64>) {
+                            let i = self.0;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
+                            *state.lock().unwrap() += 1;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
+                        }
+                    }
+                    Ex(i)
+                }};
+            }
+            scoped.as_mut().spawn(task!());
         }
 
         scoped.await.into_inner().unwrap()
