@@ -1,6 +1,6 @@
 #![feature(async_fn_traits)]
 
-use futures_util::{future::BoxFuture, task::AtomicWaker, Future};
+use futures_util::{task::AtomicWaker, Future};
 use parking_lot_core::{ParkResult, ParkToken, UnparkToken};
 use pin_project::{pin_project, pinned_drop};
 use pinned_aliasable::Aliasable;
@@ -121,7 +121,7 @@ impl<State: 'static + Sync> Scoped<State> {
 
     pub fn spawn<F, R>(self: Pin<&mut Self>, f: F) -> JoinHandle<R>
     where
-        F: for<'state> FnOnce(&'state State) -> BoxFuture<'state, R>,
+        F: AsyncFnOnceRef<State, Output = R>,
         R: Send + 'static,
     {
         let this = self.project();
@@ -144,7 +144,7 @@ impl<State: 'static + Sync> Scoped<State> {
         // SAFETY:
         // Scoped will block if dropped before all the state refs are dropped
         let state = unsafe { aliased.as_ref().get_extended() };
-        let future = (f)(&state.state);
+        let future = f.call(&state.state);
         let task = tokio::task::spawn(ScopedFuture {
             state,
             future: Some(future),
@@ -231,27 +231,37 @@ impl<T: ?Sized, U> Captures<U> for T {}
 //     type Output = Fut::Output;
 // }
 
+pub trait AsyncFnOnceRef<S>: 'static {
+    type Output: Send + 'static;
+    fn call(self, state: &S) -> impl Future<Output = Self::Output> + Captures<&S> + Send;
+}
+
 #[cfg(test)]
 mod tests {
     use std::{pin::pin, sync::Mutex, task::Context};
 
-    use futures_util::{task::noop_waker_ref, Future, FutureExt};
+    use futures_util::{task::noop_waker_ref, Future};
     use tokio::task::yield_now;
 
-    use crate::Scoped;
+    use crate::{AsyncFnOnceRef, Scoped};
 
     async fn run(n: u64) -> u64 {
         let mut scoped = pin!(Scoped::new(Mutex::new(0)));
 
+        struct Ex(u64);
+        impl AsyncFnOnceRef<Mutex<u64>> for Ex {
+            type Output = ();
+
+            async fn call(self, state: &Mutex<u64>) {
+                let i = self.0;
+                tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
+                *state.lock().unwrap() += 1;
+                tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
+            }
+        }
+
         for i in 0..n {
-            scoped.as_mut().spawn(move |state: &Mutex<u64>| {
-                async move {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
-                    *state.lock().unwrap() += 1;
-                    tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
-                }
-                .boxed()
-            });
+            scoped.as_mut().spawn(Ex(i));
         }
 
         scoped.await.into_inner().unwrap()
