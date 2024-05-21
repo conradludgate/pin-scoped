@@ -121,7 +121,7 @@ impl<State: 'static + Sync> Scoped<State> {
 
     pub fn spawn<F, R>(self: Pin<&mut Self>, f: F) -> JoinHandle<R>
     where
-        F: AsyncFnOnceRef<State, Output = R>,
+        F: for<'state> AsyncFnOnceRef<'state, State, Output = R>,
         R: Send + 'static,
     {
         let this = self.project();
@@ -231,9 +231,12 @@ impl<T: ?Sized, U> Captures<U> for T {}
 //     type Output = Fut::Output;
 // }
 
-pub trait AsyncFnOnceRef<S>: 'static {
+pub trait AsyncFnOnceRef<'state, S: 'state>: 'static {
     type Output: Send + 'static;
-    fn call(self, state: &S) -> impl Future<Output = Self::Output> + Captures<&S> + Send;
+    fn call(
+        self,
+        state: &'state S,
+    ) -> impl Future<Output = Self::Output> + Captures<&'state S> + Send;
 }
 
 #[cfg(test)]
@@ -249,10 +252,10 @@ mod tests {
         let mut scoped = pin!(Scoped::new(Mutex::new(0)));
 
         struct Ex(u64);
-        impl AsyncFnOnceRef<Mutex<u64>> for Ex {
+        impl<'state> AsyncFnOnceRef<'state, Mutex<u64>> for Ex {
             type Output = ();
 
-            async fn call(self, state: &Mutex<u64>) {
+            async fn call(self, state: &'state Mutex<u64>) {
                 let i = self.0;
                 tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
                 *state.lock().unwrap() += 1;
