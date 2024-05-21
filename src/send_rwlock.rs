@@ -55,6 +55,19 @@ pub struct RawRwLock {
     state: AtomicUsize,
 }
 
+pub struct ReadGuard<'a> {
+    lock: &'a RawRwLock,
+}
+
+impl Drop for ReadGuard<'_> {
+    fn drop(&mut self) {
+        let state = self.lock.state.fetch_sub(ONE_READER, Ordering::Release);
+        if state & (READERS_MASK | WRITER_PARKED_BIT) == (ONE_READER | WRITER_PARKED_BIT) {
+            self.lock.unlock_shared_slow();
+        }
+    }
+}
+
 impl RawRwLock {
     pub fn new() -> Self {
         Self {
@@ -82,26 +95,18 @@ impl RawRwLock {
     }
 
     #[inline]
-    pub fn try_lock_shared(&self) -> bool {
-        if self.try_lock_shared_fast(false) {
-            true
+    pub fn try_lock_shared(&self) -> Option<ReadGuard> {
+        if self.try_lock_shared_fast() || self.try_lock_shared_slow() {
+            Some(ReadGuard { lock: self })
         } else {
-            self.try_lock_shared_slow(false)
-        }
-    }
-
-    #[inline]
-    pub unsafe fn unlock_shared(&self) {
-        let state = self.state.fetch_sub(ONE_READER, Ordering::Release);
-        if state & (READERS_MASK | WRITER_PARKED_BIT) == (ONE_READER | WRITER_PARKED_BIT) {
-            self.unlock_shared_slow();
+            None
         }
     }
 }
 
 impl RawRwLock {
     #[inline(always)]
-    fn try_lock_shared_fast(&self, recursive: bool) -> bool {
+    fn try_lock_shared_fast(&self) -> bool {
         let state = self.state.load(Ordering::Relaxed);
 
         // We can't allow grabbing a shared lock if there is a writer, even if
@@ -110,7 +115,7 @@ impl RawRwLock {
             // To allow recursive locks, we make an exception and allow readers
             // to skip ahead of a pending writer to avoid deadlocking, at the
             // cost of breaking the fairness guarantees.
-            if !recursive || state & READERS_MASK == 0 {
+            if state & READERS_MASK == 0 {
                 return false;
             }
         }
@@ -125,13 +130,13 @@ impl RawRwLock {
     }
 
     #[cold]
-    fn try_lock_shared_slow(&self, recursive: bool) -> bool {
+    fn try_lock_shared_slow(&self) -> bool {
         let mut state = self.state.load(Ordering::Relaxed);
         loop {
             // This mirrors the condition in try_lock_shared_fast
             #[allow(clippy::collapsible_if)]
             if state & WRITER_BIT != 0 {
-                if !recursive || state & READERS_MASK == 0 {
+                if state & READERS_MASK == 0 {
                     return false;
                 }
             }

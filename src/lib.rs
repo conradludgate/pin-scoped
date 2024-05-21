@@ -1,21 +1,28 @@
 use futures_util::{task::AtomicWaker, Future};
 use pin_project_lite::pin_project;
 use pinned_aliasable::Aliasable;
-use send_rwlock::RawRwLock;
+use send_rwlock::{RawRwLock, ReadGuard};
 use std::{cell::UnsafeCell, mem::ManuallyDrop, pin::Pin};
 use tokio::task::{AbortHandle, JoinHandle};
 
 mod send_rwlock;
 
 pin_project! {
-    pub struct Scoped<State: 'static> {
+    /// Scope represents a scope holding some values.
+    ///
+    /// [`tokio`] tasks can be spawned in the context of this scope.
+    ///
+    /// Should the scope be dropped before those tasks complete,
+    /// the tasks will be [`aborted`](JoinHandle::abort) and the runtime
+    /// thread will block until all tasks have dropped.
+    pub struct Scope<State: 'static> {
         handles: Vec<AbortHandle>,
 
         #[pin]
         aliased: Aliasable<SharedState<State>>,
     }
 
-    impl<State: 'static> PinnedDrop for Scoped<State> {
+    impl<State: 'static> PinnedDrop for Scope<State> {
         #[inline(never)]
         fn drop(this: Pin<&mut Self>) {
             let this = this.project();
@@ -46,7 +53,7 @@ struct SharedState<State> {
     waker: AtomicWaker,
 }
 
-impl<State> Future for Scoped<State> {
+impl<State> Future for Scope<State> {
     type Output = State;
 
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<State> {
@@ -71,9 +78,9 @@ impl<State> Future for Scoped<State> {
     }
 }
 
-impl<State: 'static + Sync> Scoped<State> {
+impl<State: 'static + Sync> Scope<State> {
     pub fn new(state: State) -> Self {
-        Scoped {
+        Scope {
             handles: vec![],
             aliased: Aliasable::new(SharedState {
                 state: UnsafeCell::new(ManuallyDrop::new(state)),
@@ -83,11 +90,36 @@ impl<State: 'static + Sync> Scoped<State> {
         }
     }
 
+    /// Spawns a new asynchronous task, returning a
+    /// [`JoinHandle`] for it.
+    ///
+    /// The provided future will start running in the background immediately
+    /// when `spawn` is called, even if you don't await the returned
+    /// `JoinHandle`.
+    ///
+    /// Spawning a task enables the task to execute concurrently to other tasks. The
+    /// spawned task may execute on the current thread, or it may be sent to a
+    /// different thread to be executed.
+    ///
+    /// It is guaranteed that spawn will not synchronously poll the task being spawned.
+    /// This means that calling spawn while holding a lock does not pose a risk of
+    /// deadlocking with the spawned task.
+    ///
+    /// There is no guarantee that a spawned task will execute to completion.
+    /// When a runtime is shutdown, all outstanding tasks are dropped,
+    /// regardless of the lifecycle of that task.
+    ///
+    /// This function must be called from the context of a Tokio runtime. Tasks running on
+    /// the Tokio runtime are always inside its context, but you can also enter the context
+    /// using the [`Runtime::enter`](crate::runtime::Runtime::enter()) method.
+    ///
     /// # Panics
-    /// Panics if called after awaiting/polling the state starts
+    ///
+    /// * Panics if called from **outside** of the Tokio runtime.
+    /// * Panics if called after **awaiting** `Scope`
     pub fn spawn<F, R>(self: Pin<&mut Self>, f: F) -> JoinHandle<R>
     where
-        F: for<'state> AsyncFnOnceRef<'state, State, R>,
+        F: AsyncFnOnceRef<State, R> + 'static,
         R: Send + 'static,
     {
         let this = self.project();
@@ -97,14 +129,16 @@ impl<State: 'static + Sync> Scoped<State> {
         let state = unsafe { this.aliased.as_ref().get_extended() };
 
         // acquire the lock
-        assert!(
-            state.raw_lock.try_lock_shared(),
-            "spawn should not be called after polling the Scoped handle"
-        );
+        let _guard = state
+            .raw_lock
+            .try_lock_shared()
+            .expect("spawn should not be called after awaiting the Scope handle");
 
+        // SAFETY:
+        // state will stay valid until the returned future gets dropped.
         let future = f.call(unsafe { &*state.state.get() });
         let task = tokio::task::spawn(ScopedFuture {
-            raw_lock: &state.raw_lock,
+            _guard,
             waker: &state.waker,
             future: Some(future),
         });
@@ -115,7 +149,7 @@ impl<State: 'static + Sync> Scoped<State> {
 
 pin_project! {
     struct ScopedFuture<F> {
-        raw_lock: &'static RawRwLock,
+        _guard: ReadGuard<'static>,
         waker: &'static AtomicWaker,
         #[pin]
         future: Option<F>,
@@ -124,12 +158,8 @@ pin_project! {
     impl<F> PinnedDrop for ScopedFuture<F> {
         fn drop(this: Pin<&mut Self>) {
             let mut this = this.project();
-
-            // first, drop the future
             this.future.set(None);
-
             this.waker.wake();
-            unsafe { this.raw_lock.unlock_shared() }
         }
     }
 }
@@ -149,20 +179,23 @@ impl<F: Future> Future for ScopedFuture<F> {
     }
 }
 
-#[doc(hidden)]
-pub trait Captures<U> {}
-impl<T: ?Sized, U> Captures<U> for T {}
-
-pub trait AsyncFnOnceRef<'state, S: 'static, R: Send + 'static>: 'static {
-    fn call(self, state: &'state S) -> impl Future<Output = R> + Captures<&'state S> + Send;
+pub trait AsyncFnOnceRef<S, R> {
+    fn call(self, state: &S) -> impl Send + Future<Output = R>;
 }
 
-impl<'state, S: 'static, F, Fut, R: Send + 'static> AsyncFnOnceRef<'state, S, R> for F
+trait MyFnOnce<Arg>: FnOnce(Arg) -> Self::Ret {
+    type Ret;
+}
+impl<F: FnOnce(A) -> R, A, R> MyFnOnce<A> for F {
+    type Ret = R;
+}
+
+impl<S: 'static, F, R: Send + 'static> AsyncFnOnceRef<S, R> for F
 where
-    F: std::ops::FnOnce(&'state S) -> Fut + 'static,
-    Fut: Future<Output = R> + Send + Captures<&'state S>,
+    F: 'static + for<'state> MyFnOnce<&'state S>,
+    for<'state> <F as MyFnOnce<&'state S>>::Ret: Send + Future<Output = R>,
 {
-    fn call(self, state: &'state S) -> impl Future<Output = R> + Captures<&'state S> + Send {
+    fn call(self, state: &S) -> impl Send + Future<Output = R> {
         (self)(state)
     }
 }
@@ -174,13 +207,13 @@ mod tests {
     use futures_util::{task::noop_waker_ref, Future};
     use tokio::task::yield_now;
 
-    use crate::Scoped;
+    use crate::Scope;
 
     async fn run(n: u64) -> u64 {
-        let mut scoped = pin!(Scoped::new(Mutex::new(0)));
+        let mut scoped = pin!(Scope::new(Mutex::new(0)));
         struct Ex(u64);
-        impl<'state> super::AsyncFnOnceRef<'state, Mutex<u64>, ()> for Ex {
-            async fn call(self, state: &'state Mutex<u64>) {
+        impl super::AsyncFnOnceRef<Mutex<u64>, ()> for Ex {
+            async fn call(self, state: &Mutex<u64>) {
                 let i = self.0;
                 tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
                 *state.lock().unwrap() += 1;
