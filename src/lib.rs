@@ -6,6 +6,7 @@ use pin_project::{pin_project, pinned_drop};
 use pinned_aliasable::Aliasable;
 use std::{
     num::NonZeroUsize,
+    ops::AsyncFnOnce,
     pin::Pin,
     process::abort,
     sync::atomic::{AtomicUsize, Ordering},
@@ -121,7 +122,7 @@ impl<State: 'static + Sync> Scoped<State> {
 
     pub fn spawn<F, R>(self: Pin<&mut Self>, f: F) -> JoinHandle<R>
     where
-        F: for<'state> AsyncFnOnceRef<'state, State, Output = R>,
+        F: for<'state> AsyncFnOnceRef<'state, State, R>,
         R: Send + 'static,
     {
         let this = self.project();
@@ -231,12 +232,18 @@ impl<T: ?Sized, U> Captures<U> for T {}
 //     type Output = Fut::Output;
 // }
 
-pub trait AsyncFnOnceRef<'state, S: 'state>: 'static {
-    type Output: Send + 'static;
-    fn call(
-        self,
-        state: &'state S,
-    ) -> impl Future<Output = Self::Output> + Captures<&'state S> + Send;
+pub trait AsyncFnOnceRef<'state, S: 'static, R: Send + 'static>: 'static {
+    fn call(self, state: &'state S) -> impl Future<Output = R> + Captures<&'state S> + Send;
+}
+
+impl<'state, S: 'static, F, R: Send + 'static> AsyncFnOnceRef<'state, S, R> for F
+where
+    F: AsyncFnOnce(&'state S) -> R + 'static,
+    F::CallOnceFuture: Send + Captures<&'state S>,
+{
+    fn call(self, state: &'state S) -> impl Future<Output = R> + Captures<&'state S> + Send {
+        (self)(state)
+    }
 }
 
 #[cfg(test)]
@@ -252,9 +259,7 @@ mod tests {
         let mut scoped = pin!(Scoped::new(Mutex::new(0)));
 
         struct Ex(u64);
-        impl<'state> AsyncFnOnceRef<'state, Mutex<u64>> for Ex {
-            type Output = ();
-
+        impl<'state> AsyncFnOnceRef<'state, Mutex<u64>, ()> for Ex {
             async fn call(self, state: &'state Mutex<u64>) {
                 let i = self.0;
                 tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
