@@ -1,7 +1,7 @@
 use futures_util::{task::AtomicWaker, Future};
 use pin_project_lite::pin_project;
 use pinned_aliasable::Aliasable;
-use send_rwlock::{RawRwLock, ReadGuard};
+use send_rwlock::RawRwLock;
 use std::{cell::UnsafeCell, mem::ManuallyDrop, pin::Pin};
 use tokio::task::{AbortHandle, JoinHandle};
 
@@ -41,14 +41,18 @@ pin_project! {
             }
 
             // lock and drop the state.
-            aliased.raw_lock.lock_exclusive();
+            tokio::task::block_in_place(|| aliased.raw_lock.lock_exclusive());
             unsafe { ManuallyDrop::drop(&mut *aliased.state.get()) };
         }
     }
 }
 
+// cannot be deallocated while read lock is acquired
 struct SharedState<State> {
+    // read locks imply that tasks are still in flight
+    // write lock implies that the state has been taken out of the scope
     raw_lock: RawRwLock,
+    // only dropped if write lock is acquired.
     state: UnsafeCell<ManuallyDrop<State>>,
     waker: AtomicWaker,
 }
@@ -129,16 +133,16 @@ impl<State: 'static + Sync> Scope<State> {
         let state = unsafe { this.aliased.as_ref().get_extended() };
 
         // acquire the lock
-        let _guard = state
-            .raw_lock
-            .try_lock_shared()
-            .expect("spawn should not be called after awaiting the Scope handle");
+        assert!(
+            state.raw_lock.try_lock_shared(),
+            "spawn should not be called after awaiting the Scope handle"
+        );
 
         // SAFETY:
         // state will stay valid until the returned future gets dropped.
         let future = f.call(unsafe { &*state.state.get() });
         let task = tokio::task::spawn(ScopedFuture {
-            _guard,
+            raw_lock: &state.raw_lock,
             waker: &state.waker,
             future: Some(future),
         });
@@ -149,7 +153,7 @@ impl<State: 'static + Sync> Scope<State> {
 
 pin_project! {
     struct ScopedFuture<F> {
-        _guard: ReadGuard<'static>,
+        raw_lock: &'static RawRwLock,
         waker: &'static AtomicWaker,
         #[pin]
         future: Option<F>,
@@ -159,7 +163,14 @@ pin_project! {
         fn drop(this: Pin<&mut Self>) {
             let mut this = this.project();
             this.future.set(None);
-            this.waker.wake();
+            let waker = this.waker.take();
+            unsafe { this.raw_lock.unlock_shared(); }
+
+            // wake scope after unlocking
+            // todo: only do this if unlock_shared became exclusive
+            if let Some(waker) = waker {
+                waker.wake();
+            }
         }
     }
 }
