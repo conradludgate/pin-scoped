@@ -1,6 +1,6 @@
 use futures_util::{task::AtomicWaker, Future};
 use parking_lot_core::{ParkResult, ParkToken, UnparkToken};
-use pin_project::{pin_project, pinned_drop};
+use pin_project_lite::pin_project;
 use pinned_aliasable::Aliasable;
 use std::{
     num::NonZeroUsize,
@@ -10,52 +10,52 @@ use std::{
 };
 use tokio::task::{AbortHandle, JoinHandle};
 
-#[pin_project(PinnedDrop)]
-pub struct Scoped<State: 'static> {
-    handles: Vec<AbortHandle>,
-    #[pin]
-    aliased: Option<Aliasable<ScopedAliased<State>>>,
+pin_project! {
+    pub struct Scoped<State: 'static> {
+        handles: Vec<AbortHandle>,
+        #[pin]
+        aliased: Option<Aliasable<ScopedAliased<State>>>,
 
-    key: Option<NonZeroUsize>,
-}
+        key: Option<NonZeroUsize>,
+    }
 
-#[pinned_drop]
-impl<State: 'static> PinnedDrop for Scoped<State> {
-    #[inline(never)]
-    fn drop(self: Pin<&mut Self>) {
-        let this = self.project();
+    impl<State: 'static> PinnedDrop for Scoped<State> {
+        #[inline(never)]
+        fn drop(this: Pin<&mut Self>) {
+            let this = this.project();
 
-        let Some(key) = this.key else {
-            // scope handle was consumed
-            return;
-        };
+            let Some(key) = this.key else {
+                // scope handle was consumed
+                return;
+            };
 
-        for handle in this.handles.drain(..) {
-            handle.abort();
-        }
+            for handle in this.handles.drain(..) {
+                handle.abort();
+            }
 
-        // avoid touching aliasable, go through key pointer instead
-        // SAFETY: key was initiated from `AtomicUsize::to_ptr`.
-        // the allocation it points to is owned by self, and is therefore still valid
-        let tasks = unsafe { AtomicUsize::from_ptr(key.get() as *mut usize) };
-        if tasks.load(Ordering::Acquire) > 0 {
-            // SAFETY:
-            // 1. We control the aliased.tasks address
-            // 2. validate and timed_out do not panic or call parking_lot functions
-            // 3. before_sleep does not call park
-            let res = tokio::task::block_in_place(|| unsafe {
-                parking_lot_core::park(
-                    tasks.as_ptr() as usize,
-                    || true,
-                    || {},
-                    |_, _| {},
-                    ParkToken(0),
-                    None,
-                )
-            });
-            match res {
-                ParkResult::Invalid | ParkResult::TimedOut => abort(),
-                ParkResult::Unparked(_) => {}
+            // avoid touching aliasable, go through key pointer instead
+            // SAFETY: key was initiated from `AtomicUsize::to_ptr`.
+            // the allocation it points to is owned by self, and is therefore still valid
+            let tasks = unsafe { AtomicUsize::from_ptr(key.get() as *mut usize) };
+            if tasks.load(Ordering::Acquire) > 0 {
+                // SAFETY:
+                // 1. We control the aliased.tasks address
+                // 2. validate and timed_out do not panic or call parking_lot functions
+                // 3. before_sleep does not call park
+                let res = tokio::task::block_in_place(|| unsafe {
+                    parking_lot_core::park(
+                        tasks.as_ptr() as usize,
+                        || true,
+                        || {},
+                        |_, _| {},
+                        ParkToken(0),
+                        None,
+                    )
+                });
+                match res {
+                    ParkResult::Invalid | ParkResult::TimedOut => abort(),
+                    ParkResult::Unparked(_) => {}
+                }
             }
         }
     }
@@ -152,28 +152,28 @@ impl<State: 'static + Sync> Scoped<State> {
     }
 }
 
-#[pin_project(PinnedDrop)]
-struct ScopedFuture<State: 'static, F> {
-    state: &'static ScopedAliased<State>,
-    #[pin]
-    future: Option<F>,
-}
+pin_project! {
+    struct ScopedFuture<State: 'static, F> {
+        state: &'static ScopedAliased<State>,
+        #[pin]
+        future: Option<F>,
+    }
 
-#[pinned_drop]
-impl<State: 'static, F> PinnedDrop for ScopedFuture<State, F> {
-    fn drop(self: Pin<&mut Self>) {
-        let mut this = self.project();
+    impl<State: 'static, F> PinnedDrop for ScopedFuture<State, F> {
+        fn drop(this: Pin<&mut Self>) {
+            let mut this = this.project();
 
-        // first, drop the future
-        this.future.set(None);
+            // first, drop the future
+            this.future.set(None);
 
-        if this.state.tasks.fetch_sub(1, Ordering::Release) == 1 {
-            this.state.notification.wake();
-            // Wake up the owner on release of the last task
-            // SAFETY: We control the aliased.tasks address
-            unsafe {
-                parking_lot_core::unpark_all(this.state.tasks.as_ptr() as usize, UnparkToken(0))
-            };
+            if this.state.tasks.fetch_sub(1, Ordering::Release) == 1 {
+                this.state.notification.wake();
+                // Wake up the owner on release of the last task
+                // SAFETY: We control the aliased.tasks address
+                unsafe {
+                    parking_lot_core::unpark_all(this.state.tasks.as_ptr() as usize, UnparkToken(0))
+                };
+            }
         }
     }
 }
