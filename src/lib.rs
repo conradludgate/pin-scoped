@@ -1,22 +1,18 @@
 use futures_util::{task::AtomicWaker, Future};
-use parking_lot_core::{ParkResult, ParkToken, UnparkToken};
 use pin_project_lite::pin_project;
 use pinned_aliasable::Aliasable;
-use std::{
-    num::NonZeroUsize,
-    pin::Pin,
-    process::abort,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use send_rwlock::RawRwLock;
+use std::{cell::UnsafeCell, pin::Pin};
 use tokio::task::{AbortHandle, JoinHandle};
+
+mod send_rwlock;
 
 pin_project! {
     pub struct Scoped<State: 'static> {
         handles: Vec<AbortHandle>,
-        #[pin]
-        aliased: Option<Aliasable<ScopedAliased<State>>>,
 
-        key: Option<NonZeroUsize>,
+        #[pin]
+        aliased: Aliasable<SharedState<State>>,
     }
 
     impl<State: 'static> PinnedDrop for Scoped<State> {
@@ -24,83 +20,59 @@ pin_project! {
         fn drop(this: Pin<&mut Self>) {
             let this = this.project();
 
-            let Some(key) = this.key else {
-                // scope handle was consumed
+            if this.handles.is_empty() {
                 return;
-            };
+            }
 
             for handle in this.handles.drain(..) {
                 handle.abort();
             }
 
-            // avoid touching aliasable, go through key pointer instead
-            // SAFETY: key was initiated from `AtomicUsize::to_ptr`.
-            // the allocation it points to is owned by self, and is therefore still valid
-            let tasks = unsafe { AtomicUsize::from_ptr(key.get() as *mut usize) };
-            if tasks.load(Ordering::Acquire) > 0 {
-                // SAFETY:
-                // 1. We control the aliased.tasks address
-                // 2. validate and timed_out do not panic or call parking_lot functions
-                // 3. before_sleep does not call park
-                let res = tokio::task::block_in_place(|| unsafe {
-                    parking_lot_core::park(
-                        tasks.as_ptr() as usize,
-                        || true,
-                        || {},
-                        |_, _| {},
-                        ParkToken(0),
-                        None,
-                    )
-                });
-                match res {
-                    ParkResult::Invalid | ParkResult::TimedOut => abort(),
-                    ParkResult::Unparked(_) => {}
-                }
-            }
+            let state = {
+                let aliased = this.aliased.as_ref().get();
+
+                aliased.raw_lock.lock_exclusive();
+
+                let res = unsafe { &mut *aliased.state.get() }.take().unwrap();
+                unsafe { aliased.raw_lock.unlock_exclusive() };
+                res
+            };
+
+            drop(state);
+
         }
     }
 }
 
-struct ScopedAliased<State> {
-    tasks: AtomicUsize,
-    state: State,
-    notification: AtomicWaker,
+struct SharedState<State> {
+    raw_lock: RawRwLock,
+    state: UnsafeCell<Option<State>>,
+    waker: AtomicWaker,
 }
 
 impl<State> Future for Scoped<State> {
     type Output = State;
 
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<State> {
-        let mut this = self.project();
+        let this = self.project();
 
-        {
-            let aliased = this
-                .aliased
-                .as_mut()
-                .as_pin_mut()
-                .expect("aliased state must be set while scoped is alive");
+        let state = {
+            let aliased = this.aliased.as_ref().get();
 
             // register first to prevent race condition
-            aliased.as_ref().get().notification.register(cx.waker());
-            if aliased.as_ref().get().tasks.load(Ordering::Acquire) > 0 {
+            aliased.waker.register(cx.waker());
+            if !aliased.raw_lock.try_lock_exclusive() {
                 return std::task::Poll::Pending;
             }
 
-            _ = this.key.take();
-        }
+            let res = unsafe { &mut *aliased.state.get() }.take().unwrap();
+            unsafe { aliased.raw_lock.unlock_exclusive() };
+            res
+        };
 
         this.handles.clear();
 
-        // SAFETY: this is no longer aliased
-        let mut unaliased = unsafe {
-            this.aliased
-                .get_unchecked_mut()
-                .take()
-                .unwrap()
-                .into_inner()
-        };
-        assert_eq!(*unaliased.tasks.get_mut(), 0);
-        std::task::Poll::Ready(unaliased.state)
+        std::task::Poll::Ready(state)
     }
 }
 
@@ -108,43 +80,37 @@ impl<State: 'static + Sync> Scoped<State> {
     pub fn new(state: State) -> Self {
         Scoped {
             handles: vec![],
-            aliased: Some(Aliasable::new(ScopedAliased {
-                tasks: AtomicUsize::new(0),
-                state,
-                notification: AtomicWaker::new(),
-            })),
-            key: None,
+            aliased: Aliasable::new(SharedState {
+                state: UnsafeCell::new(Some(state)),
+                waker: AtomicWaker::new(),
+                raw_lock: RawRwLock::new(),
+            }),
         }
     }
 
+    /// # Panics
+    /// Panics if called after awaiting/polling the state starts
     pub fn spawn<F, R>(self: Pin<&mut Self>, f: F) -> JoinHandle<R>
     where
         F: for<'state> AsyncFnOnceRef<'state, State, R>,
         R: Send + 'static,
     {
         let this = self.project();
-        let aliased = this
-            .aliased
-            .as_pin_mut()
-            .expect("aliased state must be set while scoped is alive");
-
-        let addr = NonZeroUsize::new(aliased.as_ref().get().tasks.as_ptr() as usize)
-            .expect("refs should never be null");
-        if let Some(old_addr) = this.key.replace(addr) {
-            if old_addr != addr {
-                abort()
-            };
-        }
-
-        // acquire the lock
-        aliased.as_ref().get().tasks.fetch_add(1, Ordering::Release);
 
         // SAFETY:
         // Scoped will block if dropped before all the state refs are dropped
-        let state = unsafe { aliased.as_ref().get_extended() };
-        let future = f.call(&state.state);
+        let state = unsafe { this.aliased.as_ref().get_extended() };
+
+        // acquire the lock
+        assert!(
+            state.raw_lock.try_lock_shared(),
+            "spawn should not be called after polling the Scoped handle"
+        );
+
+        let future = f.call(unsafe { &*state.state.get() }.as_ref().unwrap());
         let task = tokio::task::spawn(ScopedFuture {
-            state,
+            raw_lock: &state.raw_lock,
+            waker: &state.waker,
             future: Some(future),
         });
         this.handles.push(task.abort_handle());
@@ -153,32 +119,27 @@ impl<State: 'static + Sync> Scoped<State> {
 }
 
 pin_project! {
-    struct ScopedFuture<State: 'static, F> {
-        state: &'static ScopedAliased<State>,
+    struct ScopedFuture<F> {
+        raw_lock: &'static RawRwLock,
+        waker: &'static AtomicWaker,
         #[pin]
         future: Option<F>,
     }
 
-    impl<State: 'static, F> PinnedDrop for ScopedFuture<State, F> {
+    impl<F> PinnedDrop for ScopedFuture<F> {
         fn drop(this: Pin<&mut Self>) {
             let mut this = this.project();
 
             // first, drop the future
             this.future.set(None);
 
-            if this.state.tasks.fetch_sub(1, Ordering::Release) == 1 {
-                this.state.notification.wake();
-                // Wake up the owner on release of the last task
-                // SAFETY: We control the aliased.tasks address
-                unsafe {
-                    parking_lot_core::unpark_all(this.state.tasks.as_ptr() as usize, UnparkToken(0))
-                };
-            }
+            this.waker.wake();
+            unsafe { this.raw_lock.unlock_shared() }
         }
     }
 }
 
-impl<State: 'static, F: Future> Future for ScopedFuture<State, F> {
+impl<F: Future> Future for ScopedFuture<F> {
     type Output = F::Output;
 
     fn poll(
