@@ -76,21 +76,19 @@ impl RawRwLock {
     }
 
     #[inline]
-    pub fn try_lock_shared(&self) -> bool {
+    pub fn lock_shared(&self) {
         let mut state = self.state.load(Ordering::Relaxed);
         loop {
             if state & WRITER_BIT != 0 {
-                return false;
+                panic!("inconsistent state. writer bit cannot be set")
             }
             match self.state.compare_exchange_weak(
                 state,
-                state
-                    .checked_add(ONE_READER)
-                    .expect("task count overflow"),
+                state.checked_add(ONE_READER).expect("task count overflow"),
                 Ordering::Acquire,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return true,
+                Ok(_) => return,
                 Err(x) => state = x,
             }
         }

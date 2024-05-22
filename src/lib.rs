@@ -20,6 +20,8 @@ pin_project! {
 
         #[pin]
         aliased: Aliasable<SharedState<State>>,
+
+        started_locking: bool,
     }
 
     impl<State: 'static> PinnedDrop for Scope<State> {
@@ -27,7 +29,12 @@ pin_project! {
         fn drop(this: Pin<&mut Self>) {
             let this = this.project();
             let aliased = this.aliased.as_ref().get();
+            let did_lock = *this.started_locking;
+            *this.started_locking = true;
 
+            // handles could be empty if
+            // 1. we have never spawned a task in this scope
+            // 2. we have awaited the scope and extracted the inner state
             if this.handles.is_empty() {
                 // lock and drop the state, if it's not already locked
                 if aliased.raw_lock.try_lock_exclusive() {
@@ -51,6 +58,9 @@ pin_project! {
 struct SharedState<State> {
     // read locks imply that tasks are still in flight
     // write lock implies that the state has been taken out of the scope
+    //
+    // lock can only be called by the owner of the scope.
+    // unlock can be called by any thread.
     raw_lock: RawRwLock,
     // only dropped if write lock is acquired.
     state: UnsafeCell<ManuallyDrop<State>>,
@@ -62,6 +72,8 @@ impl<State> Future for Scope<State> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<State> {
         let this = self.project();
+        let did_lock = *this.started_locking;
+        *this.started_locking = true;
 
         let state = {
             let aliased = this.aliased.as_ref().get();
@@ -91,6 +103,7 @@ impl<State: 'static + Sync> Scope<State> {
                 waker: AtomicWaker::new(),
                 raw_lock: RawRwLock::new(),
             }),
+            started_locking: false,
         }
     }
 
@@ -132,11 +145,12 @@ impl<State: 'static + Sync> Scope<State> {
         // Scoped will block if dropped before all the state refs are dropped
         let state = unsafe { this.aliased.as_ref().get_extended() };
 
+        if *this.started_locking {
+            panic!("spawn should not be called after awaiting the Scope handle")
+        }
+
         // acquire the lock
-        assert!(
-            state.raw_lock.try_lock_shared(),
-            "spawn should not be called after awaiting the Scope handle"
-        );
+        state.raw_lock.lock_shared();
 
         // SAFETY:
         // state will stay valid until the returned future gets dropped.
