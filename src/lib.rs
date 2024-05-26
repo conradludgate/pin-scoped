@@ -1,11 +1,14 @@
-use futures_util::{task::AtomicWaker, Future};
 use pin_project_lite::pin_project;
 use pinned_aliasable::Aliasable;
-use send_rwlock::RawRwLock;
-use std::{cell::UnsafeCell, mem::ManuallyDrop, pin::Pin};
+use std::future::Future;
+use std::{
+    cell::UnsafeCell,
+    mem::ManuallyDrop,
+    pin::Pin,
+    sync::{Condvar, Mutex},
+    task::Waker,
+};
 use tokio::task::{AbortHandle, JoinHandle};
-
-mod send_rwlock;
 
 pin_project! {
     /// Scope represents a scope holding some values.
@@ -29,15 +32,17 @@ pin_project! {
         fn drop(this: Pin<&mut Self>) {
             let this = this.project();
             let aliased = this.aliased.as_ref().get();
-            let did_lock = *this.started_locking;
             *this.started_locking = true;
 
             // handles could be empty if
             // 1. we have never spawned a task in this scope
             // 2. we have awaited the scope and extracted the inner state
             if this.handles.is_empty() {
-                // lock and drop the state, if it's not already locked
-                if aliased.raw_lock.try_lock_exclusive() {
+                let mut lock = aliased.lock.lock().unwrap();
+                lock.waker.take();
+                debug_assert!(lock.tasks == 0 || lock.tasks == -1);
+                if lock.tasks == 0 {
+                    lock.tasks = -1;
                     unsafe { ManuallyDrop::drop(&mut *aliased.state.get()) };
                 }
                 return;
@@ -48,23 +53,30 @@ pin_project! {
             }
 
             // lock and drop the state.
-            tokio::task::block_in_place(|| aliased.raw_lock.lock_exclusive());
+            let mut lock = aliased.lock.lock().unwrap();
+            while lock.tasks != 0 {
+                lock = aliased.condvar.wait(lock).unwrap();
+                debug_assert!(lock.tasks != -1, "state should not be dropped");
+            }
             unsafe { ManuallyDrop::drop(&mut *aliased.state.get()) };
         }
     }
 }
 
-// cannot be deallocated while read lock is acquired
 struct SharedState<State> {
-    // read locks imply that tasks are still in flight
-    // write lock implies that the state has been taken out of the scope
-    //
-    // lock can only be called by the owner of the scope.
-    // unlock can be called by any thread.
-    raw_lock: RawRwLock,
-    // only dropped if write lock is acquired.
+    lock: Mutex<LockState>,
+    condvar: Condvar,
+
+    /// initialised if and only if lock.tasks != -1
     state: UnsafeCell<ManuallyDrop<State>>,
-    waker: AtomicWaker,
+}
+
+struct LockState {
+    /// positive for read-only tasks
+    /// isize::MIN for a single mut task
+    /// -1 for when the state is removed
+    tasks: isize,
+    waker: Option<Waker>,
 }
 
 impl<State> Future for Scope<State> {
@@ -72,19 +84,25 @@ impl<State> Future for Scope<State> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<State> {
         let this = self.project();
-        let did_lock = *this.started_locking;
         *this.started_locking = true;
 
         let state = {
             let aliased = this.aliased.as_ref().get();
 
-            // register first to prevent race condition
-            aliased.waker.register(cx.waker());
-            if !aliased.raw_lock.try_lock_exclusive() {
+            let mut lock = aliased.lock.lock().unwrap();
+            if lock.tasks != 0 {
+                if let Some(waker) = &mut lock.waker {
+                    waker.clone_from(cx.waker())
+                } else {
+                    lock.waker = Some(cx.waker().clone())
+                }
                 return std::task::Poll::Pending;
             }
 
+            debug_assert!(lock.tasks != -1, "state should not be dropped");
+
             // take the state now it's locked
+            lock.tasks = -1;
             unsafe { ManuallyDrop::take(&mut *aliased.state.get()) }
         };
 
@@ -99,9 +117,12 @@ impl<State: 'static + Sync> Scope<State> {
         Scope {
             handles: vec![],
             aliased: Aliasable::new(SharedState {
+                lock: Mutex::new(LockState {
+                    waker: None,
+                    tasks: 0,
+                }),
+                condvar: Condvar::new(),
                 state: UnsafeCell::new(ManuallyDrop::new(state)),
-                waker: AtomicWaker::new(),
-                raw_lock: RawRwLock::new(),
             }),
             started_locking: false,
         }
@@ -150,14 +171,24 @@ impl<State: 'static + Sync> Scope<State> {
         }
 
         // acquire the lock
-        state.raw_lock.lock_shared();
+        {
+            let mut lock = state.lock.lock().unwrap();
+            if lock.tasks < 0 {
+                todo!(
+                    "support waiting for exclusive tasks to complete before starting shared tasks"
+                )
+            }
+            lock.tasks += 1;
+        }
+
+        // state.raw_lock.lock_shared();
 
         // SAFETY:
         // state will stay valid until the returned future gets dropped.
         let future = f.call(unsafe { &*state.state.get() });
         let task = tokio::task::spawn(ScopedFuture {
-            raw_lock: &state.raw_lock,
-            waker: &state.waker,
+            lock: &state.lock,
+            condvar: &state.condvar,
             future: Some(future),
         });
         this.handles.push(task.abort_handle());
@@ -167,8 +198,8 @@ impl<State: 'static + Sync> Scope<State> {
 
 pin_project! {
     struct ScopedFuture<F> {
-        raw_lock: &'static RawRwLock,
-        waker: &'static AtomicWaker,
+        lock: &'static Mutex<LockState>,
+        condvar: &'static Condvar,
         #[pin]
         future: Option<F>,
     }
@@ -177,11 +208,20 @@ pin_project! {
         fn drop(this: Pin<&mut Self>) {
             let mut this = this.project();
             this.future.set(None);
-            let waker = this.waker.take();
-            unsafe { this.raw_lock.unlock_shared(); }
 
-            // wake scope after unlocking
-            // todo: only do this if unlock_shared became exclusive
+            // false positive clippy warning
+            #[allow(clippy::mut_mutex_lock)]
+            let waker = {
+                let mut lock = this.lock.lock().unwrap();
+                lock.tasks -= 1;
+                if lock.tasks == 0 {
+                    this.condvar.notify_one();
+                    lock.waker.take()
+                } else {
+                    None
+                }
+            };
+
             if let Some(waker) = waker {
                 waker.wake();
             }
