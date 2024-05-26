@@ -43,23 +43,36 @@ impl<T> ManuallyDropCell<T> {
         };
     }
 
-    pub unsafe fn borrow<'a>(&self) -> (&'a T, ConstPtr<ManuallyDrop<T>>) {
+    pub unsafe fn borrow<'a>(&self) -> (&'a T, GuardPtr<ManuallyDrop<T>>) {
         let ptr = self.cell.get();
 
         #[cfg(loom)]
-        let ret = (ptr.with(|p| unsafe { &**p }), ptr);
+        let ret = (ptr.with(|p| unsafe { &**p }), GuardPtr(Some(ptr)));
         #[cfg(not(loom))]
-        let ret = (unsafe { &**ptr }, ConstPtr(PhantomData));
+        let ret = (unsafe { &**ptr }, GuardPtr(PhantomData));
 
         ret
     }
 }
 
-#[cfg(loom)]
-pub use loom::cell::ConstPtr;
-
 #[cfg(not(loom))]
-pub struct ConstPtr<T>(PhantomData<*const T>);
+pub struct GuardPtr<T>(PhantomData<*const T>);
+
+#[cfg(loom)]
+pub struct GuardPtr<T>(Option<loom::cell::ConstPtr<T>>);
+
+// Safety:
+// we never read/write the pointer value, it's only for tracking in loom.
+unsafe impl<T> Send for GuardPtr<T> {}
+
+impl<T> GuardPtr<T> {
+    pub fn release(&mut self) {
+        #[cfg(loom)]
+        {
+            self.0 = None;
+        }
+    }
+}
 
 /// An unboxed aliasable value.
 #[derive(Default)]

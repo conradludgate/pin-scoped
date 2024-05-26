@@ -6,7 +6,7 @@ use std::mem::MaybeUninit;
 use std::{mem::ManuallyDrop, pin::Pin, task::Waker};
 
 mod sync;
-use sync::{Aliasable, Condvar, ConstPtr, ManuallyDropCell, Mutex};
+use sync::{Aliasable, Condvar, GuardPtr, ManuallyDropCell, Mutex};
 
 #[cfg(feature = "tokio")]
 pub mod tokio;
@@ -292,7 +292,7 @@ impl<State: 'static + Sync, Rt: Runtime> Scope<State, Rt> {
         let task = this.runtime.spawn(ScopedFuture {
             group: &state.group,
             future: ManuallyDrop::new(future),
-            ptr_guard: Some(SendWrapper(ptr_guard)),
+            ptr_guard,
             _pinned: PhantomPinned,
         });
         this.handles.push(Rt::abort_handle(&task));
@@ -303,7 +303,7 @@ impl<State: 'static + Sync, Rt: Runtime> Scope<State, Rt> {
 struct ScopedFuture<F, S> {
     group: &'static LockGroup,
     future: ManuallyDrop<F>,
-    ptr_guard: Option<SendWrapper<ManuallyDrop<S>>>,
+    ptr_guard: GuardPtr<ManuallyDrop<S>>,
     _pinned: PhantomPinned,
 }
 
@@ -313,13 +313,12 @@ impl<F, S> Drop for ScopedFuture<F, S> {
         // we must drop this early to release the aliased shared access on state.
         // we must also be careful to uphold the pin invariants.
         unsafe { ManuallyDrop::drop(&mut self.future) };
+        self.ptr_guard.release();
 
         // false positive clippy warning
         #[allow(clippy::mut_mutex_lock)]
         let waker = {
             let mut lock = self.group.lock.lock().unwrap();
-
-            self.ptr_guard = None;
 
             lock.tasks -= SHARED;
             if lock.tasks & REMOVED == 0 {
@@ -372,13 +371,6 @@ where
         (self)(state)
     }
 }
-
-#[allow(dead_code)]
-struct SendWrapper<S>(ConstPtr<S>);
-
-// Safety:
-// we never read/write the pointer value, it's only for tracking in loom.
-unsafe impl<T> Send for SendWrapper<T> {}
 
 #[cfg(all(test, not(loom), feature = "tokio"))]
 mod tests {
