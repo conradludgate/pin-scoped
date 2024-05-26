@@ -1,5 +1,5 @@
 #![feature(async_closure)]
-#![cfg(not(loom))]
+#![cfg(all(not(loom), feature = "tokio"))]
 
 use std::{pin::pin, sync::Mutex, task::Context};
 

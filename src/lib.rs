@@ -1,12 +1,15 @@
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 use pin_project_lite::pin_project;
-use pinned_aliasable::Aliasable;
 use std::future::Future;
 use std::{mem::ManuallyDrop, pin::Pin, task::Waker};
 
 mod sync;
-use sync::{Condvar, ConstPtr, ManuallyDropCell, Mutex};
+use sync::{Aliasable, Condvar, ConstPtr, ManuallyDropCell, Mutex};
 
+#[cfg(feature = "tokio")]
 pub mod tokio;
+#[cfg(feature = "tokio")]
+pub type TokioScope<State> = Scope<State, tokio::Global>;
 
 pub trait Runtime {
     type JoinHandle<R>;
@@ -56,10 +59,18 @@ pin_project! {
             // 2. we have awaited the scope and extracted the inner state
             if this.handles.is_empty() {
                 let mut lock = aliased.lock.lock().unwrap();
+
+                // drop the waker if it's set.
                 lock.waker.take();
+
                 debug_assert!(lock.tasks == 0 || lock.tasks == -1);
+
+                // drop the state if it's set
                 if lock.tasks == 0 {
                     lock.tasks = -1;
+                    // SAFETY:
+                    // 0 tasks means we have exclusive access to state now.
+                    // and it is currently initialised.
                     unsafe { aliased.state.drop() };
                 }
                 return;
@@ -77,6 +88,13 @@ pin_project! {
                 lock.parked = false;
                 debug_assert!(lock.tasks != -1, "state should not be dropped");
             }
+
+            debug_assert!(lock.tasks == 0, "state should not be dropped or accessed by any tasks");
+            lock.tasks = -1;
+
+            // SAFETY:
+            // 0 tasks means we have exclusive access to state now.
+            // and it is currently initialised.
             unsafe { aliased.state.drop() };
         }
     }
@@ -107,9 +125,12 @@ impl<State, Rt: Runtime> Future for Scope<State, Rt> {
         *this.started_locking = true;
 
         let state = {
+            // acquire access to the shared state
             let aliased = this.aliased.as_ref().get();
-
             let mut lock = aliased.lock.lock().unwrap();
+
+            // if there are currently tasks running
+            // return pending and register the waker.
             if lock.tasks != 0 {
                 if let Some(waker) = &mut lock.waker {
                     waker.clone_from(cx.waker())
@@ -119,11 +140,15 @@ impl<State, Rt: Runtime> Future for Scope<State, Rt> {
                 return std::task::Poll::Pending;
             }
 
-            debug_assert_eq!(lock.tasks, 0, "state should not be dropped");
-
-            // take the state now it's locked
+            debug_assert!(
+                lock.tasks == 0,
+                "state should not be dropped or accessed by any tasks"
+            );
             lock.tasks = -1;
 
+            // SAFETY:
+            // 0 tasks means we have exclusive access to state now.
+            // and it is currently initialised.
             unsafe { aliased.state.take() }
         };
 
@@ -133,7 +158,6 @@ impl<State, Rt: Runtime> Future for Scope<State, Rt> {
     }
 }
 
-pub type TokioScope<State> = Scope<State, tokio::Global>;
 impl<State: 'static + Sync, Rt: Runtime + Default> Scope<State, Rt> {
     pub fn new(state: State) -> Self {
         Scope::with_runtime(state, Rt::default())
@@ -192,15 +216,16 @@ impl<State: 'static + Sync, Rt: Runtime> Scope<State, Rt> {
     {
         let this = self.project();
 
-        // SAFETY:
-        // Scoped will block if dropped before all the state refs are dropped
-        let state = unsafe { this.aliased.as_ref().get_extended() };
-
         if *this.started_locking {
             panic!("spawn should not be called after awaiting the Scope handle")
         }
 
-        // acquire the lock
+        // SAFETY:
+        // 1. `state` cannot outlive the returned futures.
+        // 2. futures cannot outlive `Scope` as scope blocked the current runtime thread on drop.
+        let state = unsafe { this.aliased.as_ref().get_extended() };
+
+        // acquire the shared access lock
         {
             let mut lock = state.lock.lock().unwrap();
             if lock.tasks < 0 {
@@ -211,10 +236,8 @@ impl<State: 'static + Sync, Rt: Runtime> Scope<State, Rt> {
             lock.tasks += 1;
         }
 
-        // state.raw_lock.lock_shared();
-
         // SAFETY:
-        // state will stay valid until the returned future gets dropped.
+        // state will stay valid for shared access until the returned future gets dropped.
         let (val, ptr_guard) = unsafe { state.state.borrow() };
         let future = f.call(val);
 
@@ -306,9 +329,12 @@ where
 
 #[allow(dead_code)]
 struct SendWrapper<S>(ConstPtr<S>);
+
+// Safety:
+// we never read/write the pointer value, it's only for tracking in loom.
 unsafe impl<T> Send for SendWrapper<T> {}
 
-#[cfg(all(test, not(loom)))]
+#[cfg(all(test, not(loom), feature = "tokio"))]
 mod tests {
     use crate::{sync::Mutex, Runtime};
     use std::{future::Future, pin::pin, task::Context, time::Duration};

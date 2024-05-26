@@ -5,7 +5,7 @@ pub use std::sync::{Condvar, Mutex};
 
 #[cfg(not(loom))]
 use std::marker::PhantomData;
-use std::mem::ManuallyDrop;
+use std::{marker::PhantomPinned, mem::ManuallyDrop, pin::Pin};
 
 #[cfg(loom)]
 use loom::cell::UnsafeCell;
@@ -60,3 +60,47 @@ pub use loom::cell::ConstPtr;
 
 #[cfg(not(loom))]
 pub struct ConstPtr<T>(PhantomData<*const T>);
+
+/// An unboxed aliasable value.
+#[derive(Default)]
+pub struct Aliasable<T> {
+    val: T,
+    _pinned: PhantomPinned,
+}
+
+impl<T> Aliasable<T> {
+    /// Create a new `Aliasable` that stores `val`.
+    #[must_use]
+    #[inline]
+    pub fn new(val: T) -> Self {
+        Self {
+            val,
+            _pinned: PhantomPinned,
+        }
+    }
+
+    /// Get a shared reference to the value inside the `Aliasable`.
+    ///
+    /// This method takes [`Pin`]`<&Self>` instead of `&self` to enforce that all parent containers
+    /// are `!`[`Unpin`], and thus won't be annotated with `noalias`.
+    ///
+    /// This crate intentionally does not provide a method to get an `&mut T`, because the value
+    /// may be shared. To obtain an `&mut T` you should use an interior mutable container such as a
+    /// mutex or [`UnsafeCell`](core::cell::UnsafeCell).
+    #[must_use]
+    #[inline]
+    pub fn get(self: Pin<&Self>) -> &T {
+        &self.get_ref().val
+    }
+
+    /// Get a shared reference to the value inside the `Aliasable` with an extended lifetime.
+    ///
+    /// # Safety
+    ///
+    /// The reference must not be held for longer than the `Aliasable` exists.
+    #[must_use]
+    #[inline]
+    pub unsafe fn get_extended<'a>(self: Pin<&Self>) -> &'a T {
+        unsafe { &*(self.get() as *const T) }
+    }
+}
