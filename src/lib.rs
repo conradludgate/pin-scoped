@@ -1,6 +1,8 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 use pin_project_lite::pin_project;
 use std::future::Future;
+use std::marker::PhantomPinned;
+use std::mem::MaybeUninit;
 use std::{mem::ManuallyDrop, pin::Pin, task::Waker};
 
 mod sync;
@@ -27,6 +29,16 @@ pub trait Runtime {
     where
         F: FnOnce() -> R;
 }
+
+/// The state is removed from the scope
+const REMOVED: isize = -SHARED;
+
+const WAKER: isize = 0b001;
+const PARKED: isize = 0b010;
+const SHARED: isize = 0b100;
+
+// /// The state is exclusively acquired from the scope
+// const EXCLUSIVE: usize = -1;
 
 pin_project! {
     /// Scope represents a scope holding some values.
@@ -58,16 +70,15 @@ pin_project! {
             // 1. we have never spawned a task in this scope
             // 2. we have awaited the scope and extracted the inner state
             if this.handles.is_empty() {
-                let mut lock = aliased.lock.lock().unwrap();
+                let mut lock = aliased.group.lock.lock().unwrap();
+                _ = lock.take_waker();
 
-                // drop the waker if it's set.
-                lock.waker.take();
-
-                debug_assert!(lock.tasks == 0 || lock.tasks == -1);
+                // waker is taken, thread is not parked.
+                debug_assert!(lock.tasks == 0 || lock.tasks == REMOVED);
 
                 // drop the state if it's set
                 if lock.tasks == 0 {
-                    lock.tasks = -1;
+                    lock.tasks = REMOVED;
                     // SAFETY:
                     // 0 tasks means we have exclusive access to state now.
                     // and it is currently initialised.
@@ -81,16 +92,19 @@ pin_project! {
             }
 
             // lock and drop the state.
-            let mut lock = aliased.lock.lock().unwrap();
-            while lock.tasks != 0 {
-                lock.parked = true;
-                lock = aliased.condvar.wait(lock).unwrap();
-                lock.parked = false;
-                debug_assert!(lock.tasks != -1, "state should not be dropped");
+            let mut lock = aliased.group.lock.lock().unwrap();
+            while lock.tasks & REMOVED != 0 {
+                lock.tasks |= PARKED;
+                lock = aliased.group.condvar.wait(lock).unwrap();
+                lock.tasks &= !PARKED;
+                debug_assert!(lock.tasks != REMOVED, "state should not be dropped");
             }
 
+            _ = lock.take_waker();
+
+            // waker is taken, thread is not parked.
             debug_assert!(lock.tasks == 0, "state should not be dropped or accessed by any tasks");
-            lock.tasks = -1;
+            lock.tasks = REMOVED;
 
             // SAFETY:
             // 0 tasks means we have exclusive access to state now.
@@ -101,11 +115,14 @@ pin_project! {
 }
 
 struct SharedState<State> {
+    group: LockGroup,
+    /// initialised if and only if group.lock.tasks != [`REMOVED`]
+    state: ManuallyDropCell<State>,
+}
+
+struct LockGroup {
     lock: Mutex<LockState>,
     condvar: Condvar,
-
-    /// initialised if and only if lock.tasks != -1
-    state: ManuallyDropCell<State>,
 }
 
 struct LockState {
@@ -113,8 +130,36 @@ struct LockState {
     /// isize::MIN for a single mut task
     /// -1 for when the state is removed
     tasks: isize,
-    parked: bool,
-    waker: Option<Waker>,
+
+    /// Set when [`WAKER`] bit of `tasks` is set.
+    waker: MaybeUninit<Waker>,
+}
+
+impl LockState {
+    fn take_waker(&mut self) -> Option<Waker> {
+        // drop the waker if it's set.
+        if self.tasks & WAKER == WAKER {
+            // unset the bit
+            self.tasks &= !WAKER;
+
+            // SAFETY: the waker bit was set, so this is init
+            unsafe { Some(MaybeUninit::assume_init_read(&self.waker)) }
+        } else {
+            None
+        }
+    }
+
+    fn register_waker(&mut self, waker: &Waker) {
+        // the waker is set.
+        if self.tasks & WAKER == WAKER {
+            // SAFETY: the waker bit was set, so this is init
+            unsafe { MaybeUninit::assume_init_mut(&mut self.waker).clone_from(waker) }
+        } else {
+            // set the waker bit
+            self.tasks |= WAKER;
+            self.waker.write(waker.clone());
+        }
+    }
 }
 
 impl<State, Rt: Runtime> Future for Scope<State, Rt> {
@@ -127,24 +172,22 @@ impl<State, Rt: Runtime> Future for Scope<State, Rt> {
         let state = {
             // acquire access to the shared state
             let aliased = this.aliased.as_ref().get();
-            let mut lock = aliased.lock.lock().unwrap();
+            let mut lock = aliased.group.lock.lock().unwrap();
 
             // if there are currently tasks running
             // return pending and register the waker.
-            if lock.tasks != 0 {
-                if let Some(waker) = &mut lock.waker {
-                    waker.clone_from(cx.waker())
-                } else {
-                    lock.waker = Some(cx.waker().clone())
-                }
+            if lock.tasks & REMOVED != 0 {
+                lock.register_waker(cx.waker());
                 return std::task::Poll::Pending;
             }
+
+            lock.take_waker();
 
             debug_assert!(
                 lock.tasks == 0,
                 "state should not be dropped or accessed by any tasks"
             );
-            lock.tasks = -1;
+            lock.tasks = REMOVED;
 
             // SAFETY:
             // 0 tasks means we have exclusive access to state now.
@@ -169,12 +212,13 @@ impl<State: 'static + Sync, Rt: Runtime> Scope<State, Rt> {
         Scope {
             handles: vec![],
             aliased: Aliasable::new(SharedState {
-                lock: Mutex::new(LockState {
-                    waker: None,
-                    parked: false,
-                    tasks: 0,
-                }),
-                condvar: Condvar::new(),
+                group: LockGroup {
+                    lock: Mutex::new(LockState {
+                        waker: MaybeUninit::uninit(),
+                        tasks: 0,
+                    }),
+                    condvar: Condvar::new(),
+                },
                 state: ManuallyDropCell::new(state),
             }),
             started_locking: false,
@@ -227,13 +271,17 @@ impl<State: 'static + Sync, Rt: Runtime> Scope<State, Rt> {
 
         // acquire the shared access lock
         {
-            let mut lock = state.lock.lock().unwrap();
+            let mut lock = state.group.lock.lock().unwrap();
             if lock.tasks < 0 {
                 todo!(
                     "support waiting for exclusive tasks to complete before starting shared tasks"
                 )
             }
-            lock.tasks += 1;
+            let Some(tasks) = lock.tasks.checked_add(SHARED) else {
+                // takes some very strange system to achieve this.
+                panic!("number of active exceeded maximum")
+            };
+            lock.tasks = tasks;
         }
 
         // SAFETY:
@@ -242,51 +290,50 @@ impl<State: 'static + Sync, Rt: Runtime> Scope<State, Rt> {
         let future = f.call(val);
 
         let task = this.runtime.spawn(ScopedFuture {
-            lock: &state.lock,
-            condvar: &state.condvar,
-            future: Some(future),
+            group: &state.group,
+            future: ManuallyDrop::new(future),
             ptr_guard: Some(SendWrapper(ptr_guard)),
+            _pinned: PhantomPinned,
         });
         this.handles.push(Rt::abort_handle(&task));
         task
     }
 }
 
-pin_project! {
-    struct ScopedFuture<F, S> {
-        lock: &'static Mutex<LockState>,
-        condvar: &'static Condvar,
-        #[pin]
-        future: Option<F>,
-        ptr_guard: Option<SendWrapper<ManuallyDrop<S>>>,
-    }
+struct ScopedFuture<F, S> {
+    group: &'static LockGroup,
+    future: ManuallyDrop<F>,
+    ptr_guard: Option<SendWrapper<ManuallyDrop<S>>>,
+    _pinned: PhantomPinned,
+}
 
-    impl<F, S> PinnedDrop for ScopedFuture<F, S> {
-        fn drop(this: Pin<&mut Self>) {
-            let mut this = this.project();
-            this.future.set(None);
+impl<F, S> Drop for ScopedFuture<F, S> {
+    fn drop(&mut self) {
+        // SAFETY: this future is always init until we drop.
+        // we must drop this early to release the aliased shared access on state.
+        // we must also be careful to uphold the pin invariants.
+        unsafe { ManuallyDrop::drop(&mut self.future) };
 
-            // false positive clippy warning
-            #[allow(clippy::mut_mutex_lock)]
-            let waker = {
-                let mut lock = this.lock.lock().unwrap();
+        // false positive clippy warning
+        #[allow(clippy::mut_mutex_lock)]
+        let waker = {
+            let mut lock = self.group.lock.lock().unwrap();
 
-                *this.ptr_guard = None;
+            self.ptr_guard = None;
 
-                lock.tasks -= 1;
-                if lock.tasks == 0 {
-                    if lock.parked {
-                        this.condvar.notify_one();
-                    }
-                    lock.waker.take()
-                } else {
-                    None
+            lock.tasks -= SHARED;
+            if lock.tasks & REMOVED == 0 {
+                if lock.tasks & PARKED == PARKED {
+                    self.group.condvar.notify_one();
                 }
-            };
-
-            if let Some(waker) = waker {
-                waker.wake();
+                lock.take_waker()
+            } else {
+                None
             }
+        };
+
+        if let Some(waker) = waker {
+            waker.wake();
         }
     }
 }
@@ -298,11 +345,10 @@ impl<F: Future, S> Future for ScopedFuture<F, S> {
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        self.project()
-            .future
-            .as_pin_mut()
-            .expect("should not be polled after drop")
-            .poll(cx)
+        // SAFETY: this future is always init until the ScopedFuture is dropped.
+        // we also do not move any data.
+        let fut = unsafe { self.map_unchecked_mut(|s| &mut *s.future) };
+        fut.poll(cx)
     }
 }
 

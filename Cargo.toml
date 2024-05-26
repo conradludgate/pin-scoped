@@ -21,7 +21,7 @@ tokio = { version = "1.37.0", optional = true, default-features = false, feature
 
 [dev-dependencies]
 futures-util = "0.3.30"
-tokio = { version = "1.37.0", default-features = false, features = ["macros", "time"] }
+tokio = { version = "1.37.0", default-features = false, features = ["sync", "macros", "time"] }
 trybuild = "1.0.96"
 
 [target.'cfg(loom)'.dependencies]
