@@ -1,14 +1,11 @@
 use pin_project_lite::pin_project;
 use pinned_aliasable::Aliasable;
 use std::future::Future;
-use std::{
-    cell::UnsafeCell,
-    mem::ManuallyDrop,
-    pin::Pin,
-    sync::{Condvar, Mutex},
-    task::Waker,
-};
+use std::{mem::ManuallyDrop, pin::Pin, task::Waker};
 use tokio::task::{AbortHandle, JoinHandle};
+
+mod sync;
+use sync::{Condvar, Mutex, UnsafeCell};
 
 pin_project! {
     /// Scope represents a scope holding some values.
@@ -43,6 +40,10 @@ pin_project! {
                 debug_assert!(lock.tasks == 0 || lock.tasks == -1);
                 if lock.tasks == 0 {
                     lock.tasks = -1;
+
+                    #[cfg(loom)]
+                    unsafe { aliased.state.with_mut(|s| ManuallyDrop::drop(&mut *s)) };
+                    #[cfg(not(loom))]
                     unsafe { ManuallyDrop::drop(&mut *aliased.state.get()) };
                 }
                 return;
@@ -58,6 +59,9 @@ pin_project! {
                 lock = aliased.condvar.wait(lock).unwrap();
                 debug_assert!(lock.tasks != -1, "state should not be dropped");
             }
+            #[cfg(loom)]
+            unsafe { aliased.state.with_mut(|s| ManuallyDrop::drop(&mut *s)) };
+            #[cfg(not(loom))]
             unsafe { ManuallyDrop::drop(&mut *aliased.state.get()) };
         }
     }
@@ -103,7 +107,12 @@ impl<State> Future for Scope<State> {
 
             // take the state now it's locked
             lock.tasks = -1;
-            unsafe { ManuallyDrop::take(&mut *aliased.state.get()) }
+
+            #[cfg(loom)]
+            let state = unsafe { aliased.state.with_mut(|s| ManuallyDrop::take(&mut *s)) };
+            #[cfg(not(loom))]
+            let state = unsafe { ManuallyDrop::take(&mut *aliased.state.get()) };
+            state
         };
 
         this.handles.clear();
@@ -185,7 +194,22 @@ impl<State: 'static + Sync> Scope<State> {
 
         // SAFETY:
         // state will stay valid until the returned future gets dropped.
-        let future = f.call(unsafe { &*state.state.get() });
+        let ptr = state.state.get();
+
+        #[cfg(loom)]
+        let future = {
+            let future = f.call(ptr.with(|p| unsafe { &*p }));
+            let ptr_guard = SendConstPtr(ptr);
+            async move {
+                let res = future.await;
+                drop(ptr_guard);
+                res
+            }
+        };
+
+        #[cfg(not(loom))]
+        let future = f.call(unsafe { &*ptr });
+
         let task = tokio::task::spawn(ScopedFuture {
             lock: &state.lock,
             condvar: &state.condvar,
@@ -264,6 +288,13 @@ where
         (self)(state)
     }
 }
+
+#[cfg(loom)]
+#[allow(dead_code)]
+/// needed to track the UnsafeCell immutable borrow when we send it across threads in the tokio::spawn
+struct SendConstPtr<T>(loom::cell::ConstPtr<T>);
+#[cfg(loom)]
+unsafe impl<T> Send for SendConstPtr<T> {}
 
 #[cfg(test)]
 mod tests {
