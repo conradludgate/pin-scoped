@@ -1,11 +1,10 @@
 use pin_project_lite::pin_project;
 use pinned_aliasable::Aliasable;
 use std::future::Future;
-use std::marker::PhantomData;
 use std::{mem::ManuallyDrop, pin::Pin, task::Waker};
 
 mod sync;
-use sync::{Condvar, Mutex, UnsafeCell};
+use sync::{Condvar, ConstPtr, ManuallyDropCell, Mutex};
 
 pub mod tokio;
 
@@ -61,11 +60,7 @@ pin_project! {
                 debug_assert!(lock.tasks == 0 || lock.tasks == -1);
                 if lock.tasks == 0 {
                     lock.tasks = -1;
-
-                    #[cfg(loom)]
-                    unsafe { aliased.state.with_mut(|s| ManuallyDrop::drop(&mut *s)) };
-                    #[cfg(not(loom))]
-                    unsafe { ManuallyDrop::drop(&mut *aliased.state.get()) };
+                    unsafe { aliased.state.drop() };
                 }
                 return;
             }
@@ -82,10 +77,7 @@ pin_project! {
                 lock.parked = false;
                 debug_assert!(lock.tasks != -1, "state should not be dropped");
             }
-            #[cfg(loom)]
-            unsafe { aliased.state.with_mut(|s| ManuallyDrop::drop(&mut *s)) };
-            #[cfg(not(loom))]
-            unsafe { ManuallyDrop::drop(&mut *aliased.state.get()) };
+            unsafe { aliased.state.drop() };
         }
     }
 }
@@ -95,7 +87,7 @@ struct SharedState<State> {
     condvar: Condvar,
 
     /// initialised if and only if lock.tasks != -1
-    state: UnsafeCell<ManuallyDrop<State>>,
+    state: ManuallyDropCell<State>,
 }
 
 struct LockState {
@@ -132,11 +124,7 @@ impl<State, Rt: Runtime> Future for Scope<State, Rt> {
             // take the state now it's locked
             lock.tasks = -1;
 
-            #[cfg(loom)]
-            let state = unsafe { aliased.state.with_mut(|s| ManuallyDrop::take(&mut *s)) };
-            #[cfg(not(loom))]
-            let state = unsafe { ManuallyDrop::take(&mut *aliased.state.get()) };
-            state
+            unsafe { aliased.state.take() }
         };
 
         this.handles.clear();
@@ -163,7 +151,7 @@ impl<State: 'static + Sync, Rt: Runtime> Scope<State, Rt> {
                     tasks: 0,
                 }),
                 condvar: Condvar::new(),
-                state: UnsafeCell::new(ManuallyDrop::new(state)),
+                state: ManuallyDropCell::new(state),
             }),
             started_locking: false,
             runtime: rt,
@@ -227,22 +215,14 @@ impl<State: 'static + Sync, Rt: Runtime> Scope<State, Rt> {
 
         // SAFETY:
         // state will stay valid until the returned future gets dropped.
-        let ptr = state.state.get();
-
-        #[cfg(loom)]
-        let future = f.call(ptr.with(|p| unsafe { &*p }));
-        #[cfg(not(loom))]
-        let future = f.call(unsafe { &*ptr });
+        let (val, ptr_guard) = unsafe { state.state.borrow() };
+        let future = f.call(val);
 
         let task = this.runtime.spawn(ScopedFuture {
             lock: &state.lock,
             condvar: &state.condvar,
             future: Some(future),
-            loom: LoomState {
-                state: PhantomData::<*const ManuallyDrop<State>>,
-                #[cfg(loom)]
-                ptr_guard: Some(ptr),
-            },
+            ptr_guard: Some(SendWrapper(ptr_guard)),
         });
         this.handles.push(Rt::abort_handle(&task));
         task
@@ -255,7 +235,7 @@ pin_project! {
         condvar: &'static Condvar,
         #[pin]
         future: Option<F>,
-        loom: LoomState<S>,
+        ptr_guard: Option<SendWrapper<ManuallyDrop<S>>>,
     }
 
     impl<F, S> PinnedDrop for ScopedFuture<F, S> {
@@ -268,10 +248,7 @@ pin_project! {
             let waker = {
                 let mut lock = this.lock.lock().unwrap();
 
-                #[cfg(loom)]
-                {
-                    this.loom.ptr_guard = None;
-                }
+                *this.ptr_guard = None;
 
                 lock.tasks -= 1;
                 if lock.tasks == 0 {
@@ -327,15 +304,11 @@ where
     }
 }
 
-struct LoomState<S> {
-    state: PhantomData<*const ManuallyDrop<S>>,
-    #[cfg(loom)]
-    ptr_guard: Option<loom::cell::ConstPtr<ManuallyDrop<S>>>,
-}
+#[allow(dead_code)]
+struct SendWrapper<S>(ConstPtr<S>);
+unsafe impl<T> Send for SendWrapper<T> {}
 
-unsafe impl<T> Send for LoomState<T> {}
-
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use crate::{sync::Mutex, Runtime};
     use std::{future::Future, pin::pin, task::Context, time::Duration};
@@ -345,20 +318,15 @@ mod tests {
 
     use crate::Scope;
 
-    #[cfg(not(loom))]
-    const DUR: Duration = Duration::from_millis(10);
-    #[cfg(loom)]
-    const DUR: Duration = Duration::from_nanos(1);
-
     async fn run(n: u32, rt: impl Runtime) -> u64 {
         let mut scoped = pin!(Scope::with_runtime(Mutex::new(0), rt));
         struct Ex(u32);
         impl super::AsyncFnOnceRef<Mutex<u64>, ()> for Ex {
             async fn call(self, state: &Mutex<u64>) {
                 let i = self.0;
-                tokio::time::sleep(DUR * i).await;
+                tokio::time::sleep(Duration::from_millis(10) * i).await;
                 *state.lock().unwrap() += 1;
-                tokio::time::sleep(DUR * i).await;
+                tokio::time::sleep(Duration::from_millis(10) * i).await;
             }
         }
 
@@ -369,13 +337,11 @@ mod tests {
         scoped.await.into_inner().unwrap()
     }
 
-    #[cfg(not(loom))]
     #[tokio::test(flavor = "multi_thread")]
     async fn scoped() {
         assert_eq!(run(64, crate::tokio::Global).await, 64);
     }
 
-    #[cfg(not(loom))]
     #[tokio::test(flavor = "multi_thread")]
     async fn dropped() {
         let mut task = pin!(run(64, crate::tokio::Global));
