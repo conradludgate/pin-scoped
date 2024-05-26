@@ -1,11 +1,30 @@
 use pin_project_lite::pin_project;
 use pinned_aliasable::Aliasable;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::{mem::ManuallyDrop, pin::Pin, task::Waker};
-use tokio::task::{AbortHandle, JoinHandle};
 
 mod sync;
 use sync::{Condvar, Mutex, UnsafeCell};
+
+pub mod tokio;
+
+pub trait Runtime {
+    type JoinHandle<R>;
+    type AbortHandle;
+
+    fn spawn<F>(&self, future: F) -> Self::JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static;
+
+    fn abort_handle<R>(handle: &Self::JoinHandle<R>) -> Self::AbortHandle;
+    fn abort(handle: Self::AbortHandle);
+
+    fn block_in_place<F, R>(f: F) -> R
+    where
+        F: FnOnce() -> R;
+}
 
 pin_project! {
     /// Scope represents a scope holding some values.
@@ -15,16 +34,18 @@ pin_project! {
     /// Should the scope be dropped before those tasks complete,
     /// the tasks will be [`aborted`](JoinHandle::abort) and the runtime
     /// thread will block until all tasks have dropped.
-    pub struct Scope<State: 'static> {
-        handles: Vec<AbortHandle>,
+    pub struct Scope<State: 'static, Rt: Runtime> {
+        handles: Vec<Rt::AbortHandle>,
 
         #[pin]
         aliased: Aliasable<SharedState<State>>,
 
         started_locking: bool,
+
+        runtime: Rt,
     }
 
-    impl<State: 'static> PinnedDrop for Scope<State> {
+    impl<State: 'static, Rt: Runtime> PinnedDrop for Scope<State, Rt> {
         #[inline(never)]
         fn drop(this: Pin<&mut Self>) {
             let this = this.project();
@@ -50,13 +71,15 @@ pin_project! {
             }
 
             for handle in this.handles.drain(..) {
-                handle.abort();
+                Rt::abort(handle);
             }
 
             // lock and drop the state.
             let mut lock = aliased.lock.lock().unwrap();
             while lock.tasks != 0 {
+                lock.parked = true;
                 lock = aliased.condvar.wait(lock).unwrap();
+                lock.parked = false;
                 debug_assert!(lock.tasks != -1, "state should not be dropped");
             }
             #[cfg(loom)]
@@ -80,10 +103,11 @@ struct LockState {
     /// isize::MIN for a single mut task
     /// -1 for when the state is removed
     tasks: isize,
+    parked: bool,
     waker: Option<Waker>,
 }
 
-impl<State> Future for Scope<State> {
+impl<State, Rt: Runtime> Future for Scope<State, Rt> {
     type Output = State;
 
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<State> {
@@ -103,7 +127,7 @@ impl<State> Future for Scope<State> {
                 return std::task::Poll::Pending;
             }
 
-            debug_assert!(lock.tasks != -1, "state should not be dropped");
+            debug_assert_eq!(lock.tasks, 0, "state should not be dropped");
 
             // take the state now it's locked
             lock.tasks = -1;
@@ -121,19 +145,28 @@ impl<State> Future for Scope<State> {
     }
 }
 
-impl<State: 'static + Sync> Scope<State> {
+pub type TokioScope<State> = Scope<State, tokio::Global>;
+impl<State: 'static + Sync, Rt: Runtime + Default> Scope<State, Rt> {
     pub fn new(state: State) -> Self {
+        Scope::with_runtime(state, Rt::default())
+    }
+}
+
+impl<State: 'static + Sync, Rt: Runtime> Scope<State, Rt> {
+    pub fn with_runtime(state: State, rt: Rt) -> Self {
         Scope {
             handles: vec![],
             aliased: Aliasable::new(SharedState {
                 lock: Mutex::new(LockState {
                     waker: None,
+                    parked: false,
                     tasks: 0,
                 }),
                 condvar: Condvar::new(),
                 state: UnsafeCell::new(ManuallyDrop::new(state)),
             }),
             started_locking: false,
+            runtime: rt,
         }
     }
 
@@ -164,7 +197,7 @@ impl<State: 'static + Sync> Scope<State> {
     ///
     /// * Panics if called from **outside** of the Tokio runtime.
     /// * Panics if called after **awaiting** `Scope`
-    pub fn spawn<F, R>(self: Pin<&mut Self>, f: F) -> JoinHandle<R>
+    pub fn spawn<F, R>(self: Pin<&mut Self>, f: F) -> Rt::JoinHandle<R>
     where
         F: AsyncFnOnceRef<State, R> + 'static,
         R: Send + 'static,
@@ -197,38 +230,35 @@ impl<State: 'static + Sync> Scope<State> {
         let ptr = state.state.get();
 
         #[cfg(loom)]
-        let future = {
-            let future = f.call(ptr.with(|p| unsafe { &*p }));
-            let ptr_guard = SendConstPtr(ptr);
-            async move {
-                let res = future.await;
-                drop(ptr_guard);
-                res
-            }
-        };
-
+        let future = f.call(ptr.with(|p| unsafe { &*p }));
         #[cfg(not(loom))]
         let future = f.call(unsafe { &*ptr });
 
-        let task = tokio::task::spawn(ScopedFuture {
+        let task = this.runtime.spawn(ScopedFuture {
             lock: &state.lock,
             condvar: &state.condvar,
             future: Some(future),
+            loom: LoomState {
+                state: PhantomData::<*const ManuallyDrop<State>>,
+                #[cfg(loom)]
+                ptr_guard: Some(ptr),
+            },
         });
-        this.handles.push(task.abort_handle());
+        this.handles.push(Rt::abort_handle(&task));
         task
     }
 }
 
 pin_project! {
-    struct ScopedFuture<F> {
+    struct ScopedFuture<F, S> {
         lock: &'static Mutex<LockState>,
         condvar: &'static Condvar,
         #[pin]
         future: Option<F>,
+        loom: LoomState<S>,
     }
 
-    impl<F> PinnedDrop for ScopedFuture<F> {
+    impl<F, S> PinnedDrop for ScopedFuture<F, S> {
         fn drop(this: Pin<&mut Self>) {
             let mut this = this.project();
             this.future.set(None);
@@ -237,9 +267,17 @@ pin_project! {
             #[allow(clippy::mut_mutex_lock)]
             let waker = {
                 let mut lock = this.lock.lock().unwrap();
+
+                #[cfg(loom)]
+                {
+                    this.loom.ptr_guard = None;
+                }
+
                 lock.tasks -= 1;
                 if lock.tasks == 0 {
-                    this.condvar.notify_one();
+                    if lock.parked {
+                        this.condvar.notify_one();
+                    }
                     lock.waker.take()
                 } else {
                     None
@@ -253,7 +291,7 @@ pin_project! {
     }
 }
 
-impl<F: Future> Future for ScopedFuture<F> {
+impl<F: Future, S> Future for ScopedFuture<F, S> {
     type Output = F::Output;
 
     fn poll(
@@ -289,31 +327,38 @@ where
     }
 }
 
-#[cfg(loom)]
-#[allow(dead_code)]
-/// needed to track the UnsafeCell immutable borrow when we send it across threads in the tokio::spawn
-struct SendConstPtr<T>(loom::cell::ConstPtr<T>);
-#[cfg(loom)]
-unsafe impl<T> Send for SendConstPtr<T> {}
+struct LoomState<S> {
+    state: PhantomData<*const ManuallyDrop<S>>,
+    #[cfg(loom)]
+    ptr_guard: Option<loom::cell::ConstPtr<ManuallyDrop<S>>>,
+}
+
+unsafe impl<T> Send for LoomState<T> {}
 
 #[cfg(test)]
 mod tests {
-    use std::{pin::pin, sync::Mutex, task::Context};
+    use crate::{sync::Mutex, Runtime};
+    use std::{future::Future, pin::pin, task::Context, time::Duration};
 
-    use futures_util::{task::noop_waker_ref, Future};
+    use futures_util::task::noop_waker_ref;
     use tokio::task::yield_now;
 
     use crate::Scope;
 
-    async fn run(n: u64) -> u64 {
-        let mut scoped = pin!(Scope::new(Mutex::new(0)));
-        struct Ex(u64);
+    #[cfg(not(loom))]
+    const DUR: Duration = Duration::from_millis(10);
+    #[cfg(loom)]
+    const DUR: Duration = Duration::from_nanos(1);
+
+    async fn run(n: u32, rt: impl Runtime) -> u64 {
+        let mut scoped = pin!(Scope::with_runtime(Mutex::new(0), rt));
+        struct Ex(u32);
         impl super::AsyncFnOnceRef<Mutex<u64>, ()> for Ex {
             async fn call(self, state: &Mutex<u64>) {
                 let i = self.0;
-                tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
+                tokio::time::sleep(DUR * i).await;
                 *state.lock().unwrap() += 1;
-                tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
+                tokio::time::sleep(DUR * i).await;
             }
         }
 
@@ -324,14 +369,16 @@ mod tests {
         scoped.await.into_inner().unwrap()
     }
 
+    #[cfg(not(loom))]
     #[tokio::test(flavor = "multi_thread")]
     async fn scoped() {
-        assert_eq!(run(64).await, 64);
+        assert_eq!(run(64, crate::tokio::Global).await, 64);
     }
 
+    #[cfg(not(loom))]
     #[tokio::test(flavor = "multi_thread")]
     async fn dropped() {
-        let mut task = pin!(run(64));
+        let mut task = pin!(run(64, crate::tokio::Global));
         assert!(task
             .as_mut()
             .poll(&mut Context::from_waker(noop_waker_ref()))

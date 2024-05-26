@@ -3,11 +3,11 @@
 use std::{pin::pin, sync::Mutex};
 use tokio::task::yield_now;
 
-use pin_scoped::Scope;
+use pin_scoped::TokioScope;
 
 #[tokio::main]
 async fn main()  {
-    let mut scoped = pin!(Scope::new(Mutex::new(0)));
+    let mut scoped = pin!(TokioScope::new(Mutex::new(0)));
 
     let non_scoped = Mutex::new(0);
 

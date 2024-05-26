@@ -1,0 +1,34 @@
+warning: unused import: `sync::Mutex`
+ --> tests/ui/03-return-state.rs:3:21
+  |
+3 | use std::{pin::pin, sync::Mutex};
+  |                     ^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: variable `state` is assigned to, but never used
+  --> tests/ui/03-return-state.rs:13:13
+   |
+13 |     let mut state = scoped.await;
+   |             ^^^^^
+   |
+   = note: consider using `_state` instead
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: value assigned to `state` is never read
+  --> tests/ui/03-return-state.rs:16:5
+   |
+16 |     state += 1;
+   |     ^^^^^
+   |
+   = help: maybe it is overwritten before being read?
+   = note: `#[warn(unused_assignments)]` on by default
+
+error: lifetime may not live long enough
+  --> tests/ui/03-return-state.rs:11:65
+   |
+11 |     let handle = scoped.as_mut().spawn(async move |state: &u64| state);
+   |                                                           -   - ^^^^^ returning this value requires that `'1` must outlive `'2`
+   |                                                           |   |
+   |                                                           |   return type of async closure `{async closure body@$DIR/tests/ui/03-return-state.rs:11:65: 11:70}` contains a lifetime `'2`
+   |                                                           let's call the lifetime of this reference `'1`
