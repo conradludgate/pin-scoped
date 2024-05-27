@@ -11,7 +11,7 @@ async fn main() {
     let handle = scoped.as_mut().spawn(async move |state: &u64| state);
 
     let mut state = scoped.await;
-    let state2 = handle.await.unwrap();
+    let state2 = handle.await.unwrap().unwrap();
 
     state += 1;
     println!("{state2}")

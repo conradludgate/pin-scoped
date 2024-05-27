@@ -16,6 +16,7 @@ std = []
 tokio = ["dep:tokio"]
 
 [dependencies]
+pin-list = "0.1.0"
 pin-project-lite = "0.2"
 
 # only used for no_std

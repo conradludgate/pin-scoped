@@ -1,15 +1,13 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![no_std]
 
-// temporary measure
-extern crate alloc;
-
 #[cfg(feature = "std")]
 extern crate std;
 
 use core::future::Future;
 use core::marker::PhantomPinned;
 use core::mem::MaybeUninit;
+use core::sync::atomic::AtomicBool;
 use core::task::{Context, Poll};
 use core::{mem::ManuallyDrop, pin::Pin, task::Waker};
 use pin_project_lite::pin_project;
@@ -42,13 +40,18 @@ pub trait Runtime {
         F: FnOnce() -> R;
 }
 
-/// The state is removed from the scope
-const REMOVED: isize = -SHARED;
+// The waker is set
+const WAKER: usize = 0b00001;
+// The scope owner has parked the thread
+const PARKED: usize = 0b00010;
+// The scope is closed and all tasks should stop
+const CLOSED: usize = 0b00100;
+// The scope state has been removed
+const REMOVED: usize = 0b01000;
 
-const WAKER: isize = 0b001;
-#[allow(dead_code)]
-const PARKED: isize = 0b010;
-const SHARED: isize = 0b100;
+// value of 1 task sharing the state
+const SHARED: usize = 0b10000;
+const SHARED_MASK: usize = !SHARED + 1;
 
 // /// The state is exclusively acquired from the scope
 // const EXCLUSIVE: usize = -1;
@@ -62,8 +65,6 @@ pin_project! {
     /// the tasks will be [`aborted`](JoinHandle::abort) and the runtime
     /// thread will block until all tasks have dropped.
     pub struct Scope<State: 'static, Rt: Runtime> {
-        handles: alloc::vec::Vec<Rt::AbortHandle>,
-
         #[pin]
         aliased: Aliasable<SharedState<State>>,
 
@@ -79,41 +80,31 @@ pin_project! {
             let aliased = this.aliased.as_ref().get();
             *this.started_locking = true;
 
-            // handles could be empty if
-            // 1. we have never spawned a task in this scope
-            // 2. we have awaited the scope and extracted the inner state
-            if this.handles.is_empty() {
-                let mut lock = aliased.group.lock.lock().unwrap();
-                _ = lock.take_waker();
+            // lock and drop the state.
+            let mut lock = aliased.group.lock.lock().unwrap();
 
-                // waker is taken, thread is not parked.
-                debug_assert!(lock.tasks == 0 || lock.tasks == REMOVED);
-
-                // drop the state if it's set
-                if lock.tasks == 0 {
-                    lock.tasks = REMOVED;
-                    // SAFETY:
-                    // 0 tasks means we have exclusive access to state now.
-                    // and it is currently initialised.
-                    unsafe { aliased.state.drop() };
-                }
+            // might have already been removed by poll()
+            if lock.tasks & REMOVED == REMOVED {
                 return;
             }
 
-            for handle in this.handles.drain(..) {
-                Rt::abort(handle);
+            lock.tasks |= CLOSED; // mark as closed.
+
+            let mut cancel_cursor = lock.cancel_list.cursor_front_mut();
+            while let Some(head) = cancel_cursor.unprotected() {
+                head.store(true, core::sync::atomic::Ordering::Release);
+                _ = cancel_cursor.remove_current(())
             }
 
-            // lock and drop the state.
-            let mut lock = aliased.group.lock.lock().unwrap();
-            while lock.tasks & REMOVED != 0 {
+            while lock.tasks & SHARED_MASK != 0 {
+                lock.tasks |= PARKED;
+
                 #[cfg(any(loom, feature = "std"))]
                 {
-                    lock.tasks |= PARKED;
                     lock = aliased.group.condvar.wait(lock).unwrap();
-                    lock.tasks &= !PARKED;
                 }
 
+                // best we can do is spin on no_std
                 #[cfg(not(any(loom, feature = "std")))]
                 {
                     drop(lock);
@@ -121,14 +112,13 @@ pin_project! {
                     lock = aliased.group.lock.lock().unwrap();
                 }
 
-                debug_assert!(lock.tasks != REMOVED, "state should not be dropped");
+                lock.tasks &= !PARKED;
             }
 
             _ = lock.take_waker();
 
-            // waker is taken, thread is not parked.
-            debug_assert!(lock.tasks == 0, "state should not be dropped or accessed by any tasks");
-            lock.tasks = REMOVED;
+            debug_assert!(lock.tasks & REMOVED == 0, "state should not be dropped");
+            lock.tasks |= REMOVED;
 
             // SAFETY:
             // 0 tasks means we have exclusive access to state now.
@@ -154,10 +144,13 @@ struct LockState {
     /// positive for read-only tasks
     /// isize::MIN for a single mut task
     /// -1 for when the state is removed
-    tasks: isize,
+    tasks: usize,
 
     /// Set when [`WAKER`] bit of `tasks` is set.
     waker: MaybeUninit<Waker>,
+
+    /// The list of currently active tasks
+    cancel_list: pin_list::PinList<CancelTypes>,
 }
 
 impl LockState {
@@ -201,26 +194,23 @@ impl<State, Rt: Runtime> Future for Scope<State, Rt> {
 
             // if there are currently tasks running
             // return pending and register the waker.
-            if lock.tasks & REMOVED != 0 {
+            if lock.tasks & SHARED_MASK != 0 {
                 lock.register_waker(cx.waker());
                 return Poll::Pending;
             }
 
+            debug_assert!(lock.cancel_list.is_empty());
+
             lock.take_waker();
 
-            debug_assert!(
-                lock.tasks == 0,
-                "state should not be dropped or accessed by any tasks"
-            );
-            lock.tasks = REMOVED;
+            debug_assert!(lock.tasks & REMOVED == 0, "state should not be dropped");
+            lock.tasks |= REMOVED;
 
             // SAFETY:
             // 0 tasks means we have exclusive access to state now.
             // and it is currently initialised.
             unsafe { aliased.state.take() }
         };
-
-        this.handles.clear();
 
         Poll::Ready(state)
     }
@@ -235,12 +225,12 @@ impl<State: 'static + Sync, Rt: Runtime + Default> Scope<State, Rt> {
 impl<State: 'static + Sync, Rt: Runtime> Scope<State, Rt> {
     pub fn with_runtime(state: State, rt: Rt) -> Self {
         Scope {
-            handles: alloc::vec::Vec::new(),
             aliased: Aliasable::new(SharedState {
                 group: LockGroup {
                     lock: Mutex::new(LockState {
                         waker: MaybeUninit::uninit(),
                         tasks: 0,
+                        cancel_list: pin_list::PinList::new(pin_list::id::Checked::new()),
                     }),
                     #[cfg(any(loom, feature = "std"))]
                     condvar: Condvar::new(),
@@ -279,7 +269,7 @@ impl<State: 'static + Sync, Rt: Runtime> Scope<State, Rt> {
     ///
     /// * Panics if called from **outside** of the Tokio runtime.
     /// * Panics if called after **awaiting** `Scope`
-    pub fn spawn<F, R>(self: Pin<&mut Self>, f: F) -> Rt::JoinHandle<R>
+    pub fn spawn<F, R>(self: Pin<&mut Self>, f: F) -> Rt::JoinHandle<Result<R, Cancelled>>
     where
         F: AsyncFnOnceRef<State, R> + 'static,
         R: Send + 'static,
@@ -298,11 +288,6 @@ impl<State: 'static + Sync, Rt: Runtime> Scope<State, Rt> {
         // acquire the shared access lock
         {
             let mut lock = state.group.lock.lock().unwrap();
-            if lock.tasks < 0 {
-                todo!(
-                    "support waiting for exclusive tasks to complete before starting shared tasks"
-                )
-            }
             let Some(tasks) = lock.tasks.checked_add(SHARED) else {
                 // takes some very strange system to achieve this.
                 panic!("number of active exceeded maximum")
@@ -315,63 +300,122 @@ impl<State: 'static + Sync, Rt: Runtime> Scope<State, Rt> {
         let (val, ptr_guard) = unsafe { state.state.borrow() };
         let future = f.call(val);
 
-        let task = this.runtime.spawn(ScopedFuture {
+        this.runtime.spawn(ScopedFuture {
             group: &state.group,
             future: ManuallyDrop::new(future),
+            cancel_node: pin_list::Node::new(),
             ptr_guard,
             _pinned: PhantomPinned,
-        });
-        this.handles.push(Rt::abort_handle(&task));
-        task
+        })
     }
 }
 
-struct ScopedFuture<F, S> {
-    group: &'static LockGroup,
-    future: ManuallyDrop<F>,
-    ptr_guard: GuardPtr<ManuallyDrop<S>>,
-    _pinned: PhantomPinned,
-}
+type CancelTypes = dyn pin_list::Types<
+    Id = pin_list::id::Checked,
+    Protected = (),
+    Removed = (),
+    Unprotected = AtomicBool,
+>;
 
-impl<F, S> Drop for ScopedFuture<F, S> {
-    fn drop(&mut self) {
-        // SAFETY: this future is always init until we drop.
-        // we must drop this early to release the aliased shared access on state.
-        // we must also be careful to uphold the pin invariants.
-        unsafe { ManuallyDrop::drop(&mut self.future) };
-        self.ptr_guard.release();
+pin_project! {
+    struct ScopedFuture<F, S> {
+        group: &'static LockGroup,
 
-        // false positive clippy warning
-        #[allow(clippy::mut_mutex_lock)]
-        let waker = {
-            let mut lock = self.group.lock.lock().unwrap();
+        #[pin]
+        future: ManuallyDrop<F>,
+        #[pin]
+        cancel_node: pin_list::Node<CancelTypes>,
 
-            lock.tasks -= SHARED;
-            if lock.tasks & REMOVED == 0 {
-                #[cfg(any(loom, feature = "std"))]
-                if lock.tasks & PARKED == PARKED {
-                    self.group.condvar.notify_one();
+        ptr_guard: GuardPtr<ManuallyDrop<S>>,
+        _pinned: PhantomPinned,
+    }
+
+    impl<F, S> PinnedDrop for ScopedFuture<F, S> {
+        fn drop(this: Pin<&mut Self>) {
+            let this = this.project();
+
+            // SAFETY: it is safe to drop a pinned value. in fact, it is required.
+            // we drop it early to ensure that state is not aliased while we release the locks
+            unsafe { ManuallyDrop::drop(this.future.get_unchecked_mut()) }
+            this.ptr_guard.release();
+
+            // false positive clippy warning
+            #[allow(clippy::mut_mutex_lock)]
+            let waker = {
+                let mut lock = this.group.lock.lock().unwrap();
+
+                if let Some(init) = this.cancel_node.initialized_mut() {
+                    // detach it
+                    _ = init.reset(&mut lock.cancel_list);
                 }
-                lock.take_waker()
-            } else {
-                None
-            }
-        };
 
-        if let Some(waker) = waker {
-            waker.wake();
+                lock.tasks -= SHARED;
+                if lock.tasks & SHARED_MASK == 0 {
+                    #[cfg(any(loom, feature = "std"))]
+                    if lock.tasks & PARKED == PARKED {
+                        this.group.condvar.notify_one();
+                    }
+                    lock.take_waker()
+                } else {
+                    None
+                }
+            };
+
+            if let Some(waker) = waker {
+                waker.wake();
+            }
         }
     }
 }
 
+#[derive(Debug)]
+pub struct Cancelled(());
+
+impl core::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("the task was cancelled")
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for Cancelled {}
+
 impl<F: Future, S> Future for ScopedFuture<F, S> {
-    type Output = F::Output;
+    type Output = Result<F::Output, Cancelled>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // SAFETY: this future is always init until the ScopedFuture is dropped.
-        // we also do not move any data.
-        let fut = unsafe { self.map_unchecked_mut(|s| &mut *s.future) };
-        fut.poll(cx)
+        let this = self.project();
+
+        // SAFETY: future is always init and we do not move anything
+        let future = unsafe { this.future.map_unchecked_mut(|f| &mut **f) };
+
+        if let Some(init) = this.cancel_node.initialized() {
+            // check the shutdown flag
+            if init
+                .unprotected()
+                .load(core::sync::atomic::Ordering::Acquire)
+            {
+                #[cfg(feature = "std")]
+                {
+                    std::dbg!("init closed");
+                }
+                return Poll::Ready(Err(Cancelled(())));
+            }
+        } else {
+            let mut lock = this.group.lock.lock().unwrap();
+            if lock.tasks & CLOSED == CLOSED {
+                #[cfg(feature = "std")]
+                {
+                    std::dbg!("uninit closed");
+                }
+                return Poll::Ready(Err(Cancelled(())));
+            }
+
+            lock.cancel_list
+                .push_back(this.cancel_node, (), AtomicBool::new(false));
+        }
+
+        future.poll(cx).map(Ok)
     }
 }
 
