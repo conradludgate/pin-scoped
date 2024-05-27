@@ -5,7 +5,6 @@
 extern crate std;
 
 use core::future::Future;
-use core::marker::PhantomPinned;
 use core::mem::MaybeUninit;
 use core::sync::atomic::AtomicBool;
 use core::task::{Context, Poll};
@@ -296,12 +295,15 @@ impl<State: 'static + Sync, Rt: Runtime> Scope<State, Rt> {
         let (val, ptr_guard) = unsafe { state.state.borrow() };
         let future = f.call(val);
 
-        this.runtime.spawn(ScopedFuture {
+        let inner = ScopeGuard {
             group: &state.group,
-            future: ManuallyDrop::new(future),
             cancel_node: pin_list::Node::new(),
+        };
+
+        this.runtime.spawn(ScopedFuture {
+            inner,
+            future: ManuallyDrop::new(future),
             ptr_guard,
-            _pinned: PhantomPinned,
         })
     }
 }
@@ -314,26 +316,15 @@ type CancelTypes = dyn pin_list::Types<
 >;
 
 pin_project! {
-    struct ScopedFuture<F, S> {
+    struct ScopeGuard {
         group: &'static LockGroup,
-
-        #[pin]
-        future: ManuallyDrop<F>,
         #[pin]
         cancel_node: pin_list::Node<CancelTypes>,
-
-        ptr_guard: GuardPtr<ManuallyDrop<S>>,
-        _pinned: PhantomPinned,
     }
 
-    impl<F, S> PinnedDrop for ScopedFuture<F, S> {
+    impl PinnedDrop for ScopeGuard {
         fn drop(this: Pin<&mut Self>) {
             let this = this.project();
-
-            // SAFETY: it is safe to drop a pinned value. in fact, it is required.
-            // we drop it early to ensure that state is not aliased while we release the locks
-            unsafe { ManuallyDrop::drop(this.future.get_unchecked_mut()) }
-            this.ptr_guard.release();
 
             // false positive clippy warning
             #[allow(clippy::mut_mutex_lock)]
@@ -364,6 +355,75 @@ pin_project! {
     }
 }
 
+impl ScopeGuard {
+    #[inline]
+    fn check_cancelled(mut self: Pin<&mut Self>) -> Result<(), Cancelled> {
+        if let Some(init) = self.as_mut().project().cancel_node.initialized() {
+            // check the shutdown flag
+            if init
+                .unprotected()
+                .load(core::sync::atomic::Ordering::Acquire)
+            {
+                return Err(Cancelled(()));
+            }
+        } else {
+            self.init_cancellation_node()?;
+        }
+        Ok(())
+    }
+
+    #[cold]
+    fn init_cancellation_node(self: Pin<&mut Self>) -> Result<(), Cancelled> {
+        let this = self.project();
+        debug_assert!(this.cancel_node.is_initial());
+
+        let mut lock = this.group.lock.lock().unwrap();
+
+        if lock.tasks & CLOSED == CLOSED {
+            return Err(Cancelled(()));
+        }
+
+        lock.cancel_list
+            .push_back(this.cancel_node, (), AtomicBool::new(false));
+
+        Ok(())
+    }
+}
+
+pin_project! {
+    struct ScopedFuture<F, S> {
+        #[pin]
+        inner: ScopeGuard,
+        #[pin]
+        future: ManuallyDrop<F>,
+        ptr_guard: GuardPtr<ManuallyDrop<S>>,
+    }
+
+    impl<F, S> PinnedDrop for ScopedFuture<F, S> {
+        fn drop(this: Pin<&mut Self>) {
+            let this = this.project();
+
+            // SAFETY: it is safe to drop a pinned value. in fact, it is required.
+            // we drop it early to ensure that state is not aliased while we release the locks
+            unsafe { ManuallyDrop::drop(this.future.get_unchecked_mut()) }
+            this.ptr_guard.release();
+        }
+    }
+}
+
+impl<F: Future, S> Future for ScopedFuture<F, S> {
+    type Output = Result<F::Output, Cancelled>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        this.inner.check_cancelled()?;
+
+        // SAFETY: future is always init and we do not move anything
+        let future = unsafe { this.future.map_unchecked_mut(|f| &mut **f) };
+        future.poll(cx).map(Ok)
+    }
+}
+
 #[derive(Debug)]
 pub struct Cancelled(());
 
@@ -375,45 +435,6 @@ impl core::fmt::Display for Cancelled {
 
 #[cfg(feature = "std")]
 impl std::error::Error for Cancelled {}
-
-impl<F: Future, S> Future for ScopedFuture<F, S> {
-    type Output = Result<F::Output, Cancelled>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-
-        // SAFETY: future is always init and we do not move anything
-        let future = unsafe { this.future.map_unchecked_mut(|f| &mut **f) };
-
-        if let Some(init) = this.cancel_node.initialized() {
-            // check the shutdown flag
-            if init
-                .unprotected()
-                .load(core::sync::atomic::Ordering::Acquire)
-            {
-                #[cfg(feature = "std")]
-                {
-                    std::dbg!("init closed");
-                }
-                return Poll::Ready(Err(Cancelled(())));
-            }
-        } else {
-            let mut lock = this.group.lock.lock().unwrap();
-            if lock.tasks & CLOSED == CLOSED {
-                #[cfg(feature = "std")]
-                {
-                    std::dbg!("uninit closed");
-                }
-                return Poll::Ready(Err(Cancelled(())));
-            }
-
-            lock.cancel_list
-                .push_back(this.cancel_node, (), AtomicBool::new(false));
-        }
-
-        future.poll(cx).map(Ok)
-    }
-}
 
 pub trait AsyncFnOnceRef<S, R> {
     fn call(self, state: &S) -> impl Send + Future<Output = R>;
