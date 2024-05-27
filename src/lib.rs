@@ -25,15 +25,11 @@ pub type TokioScope<State> = Scope<State, tokio::Global>;
 
 pub trait Runtime {
     type JoinHandle<R>;
-    type AbortHandle;
 
     fn spawn<F>(&self, future: F) -> Self::JoinHandle<F::Output>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static;
-
-    fn abort_handle<R>(handle: &Self::JoinHandle<R>) -> Self::AbortHandle;
-    fn abort(handle: Self::AbortHandle);
 
     fn block_in_place<F, R>(f: F) -> R
     where

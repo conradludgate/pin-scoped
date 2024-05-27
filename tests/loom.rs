@@ -106,7 +106,6 @@ struct Rt {
 
 impl Runtime for Rt {
     type JoinHandle<R> = PhantomData<R>;
-    type AbortHandle = ();
 
     fn spawn<F>(&self, future: F) -> Self::JoinHandle<F::Output>
     where
@@ -125,10 +124,6 @@ impl Runtime for Rt {
         }
         PhantomData
     }
-
-    fn abort_handle<R>(_handle: &Self::JoinHandle<R>) -> Self::AbortHandle {}
-
-    fn abort(_handle: Self::AbortHandle) {}
 
     fn block_in_place<F, R>(f: F) -> R
     where
