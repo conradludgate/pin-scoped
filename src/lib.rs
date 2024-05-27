@@ -88,7 +88,7 @@ pin_project! {
             let mut cancel_cursor = lock.cancel_list.cursor_front_mut();
             while let Some(head) = cancel_cursor.unprotected() {
                 head.store(true, core::sync::atomic::Ordering::Release);
-                _ = cancel_cursor.remove_current(())
+                cancel_cursor.remove_current(()).unwrap().wake();
             }
 
             while lock.tasks & SHARED_MASK != 0 {
@@ -310,7 +310,7 @@ impl<State: 'static + Sync, Rt: Runtime> Scope<State, Rt> {
 
 type CancelTypes = dyn pin_list::Types<
     Id = pin_list::id::Checked,
-    Protected = (),
+    Protected = Waker,
     Removed = (),
     Unprotected = AtomicBool,
 >;
@@ -357,7 +357,7 @@ pin_project! {
 
 impl ScopeGuard {
     #[inline]
-    fn check_cancelled(mut self: Pin<&mut Self>) -> Result<(), Cancelled> {
+    fn check_cancelled(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Result<(), Cancelled> {
         if let Some(init) = self.as_mut().project().cancel_node.initialized() {
             // check the shutdown flag
             if init
@@ -366,14 +366,21 @@ impl ScopeGuard {
             {
                 return Err(Cancelled(()));
             }
+            // Problem:
+            // If the waker changes between polls, this behaves poorly.
+            // however, I don't know any popular executors that don't
+            // use the same waker per top-level task poll.
+            // init.protected_mut(&mut self.project().lock.lock().unwrap().cancel_list).clone_from(cx.waker())
+            // not, this does not make this crate unsound, it just delays the cancellation of the task, potentially
+            // indefinitely. oh well.
         } else {
-            self.init_cancellation_node()?;
+            self.init_cancellation_node(cx)?;
         }
         Ok(())
     }
 
     #[cold]
-    fn init_cancellation_node(self: Pin<&mut Self>) -> Result<(), Cancelled> {
+    fn init_cancellation_node(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Result<(), Cancelled> {
         let this = self.project();
         debug_assert!(this.cancel_node.is_initial());
 
@@ -384,7 +391,7 @@ impl ScopeGuard {
         }
 
         lock.cancel_list
-            .push_back(this.cancel_node, (), AtomicBool::new(false));
+            .push_back(this.cancel_node, cx.waker().clone(), AtomicBool::new(false));
 
         Ok(())
     }
@@ -416,7 +423,7 @@ impl<F: Future, S> Future for ScopedFuture<F, S> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
-        this.inner.check_cancelled()?;
+        this.inner.check_cancelled(cx)?;
 
         // SAFETY: future is always init and we do not move anything
         let future = unsafe { this.future.map_unchecked_mut(|f| &mut **f) };
