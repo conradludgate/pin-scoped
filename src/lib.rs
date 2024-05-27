@@ -1,12 +1,24 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![no_std]
+
+// temporary measure
+extern crate alloc;
+
+#[cfg(feature = "std")]
+extern crate std;
+
+use core::future::Future;
+use core::marker::PhantomPinned;
+use core::mem::MaybeUninit;
+use core::task::{Context, Poll};
+use core::{mem::ManuallyDrop, pin::Pin, task::Waker};
 use pin_project_lite::pin_project;
-use std::future::Future;
-use std::marker::PhantomPinned;
-use std::mem::MaybeUninit;
-use std::{mem::ManuallyDrop, pin::Pin, task::Waker};
 
 mod sync;
-use sync::{Aliasable, Condvar, GuardPtr, ManuallyDropCell, Mutex};
+use sync::{Aliasable, GuardPtr, ManuallyDropCell, Mutex};
+
+#[cfg(any(loom, feature = "std"))]
+use sync::Condvar;
 
 #[cfg(feature = "tokio")]
 pub mod tokio;
@@ -34,6 +46,7 @@ pub trait Runtime {
 const REMOVED: isize = -SHARED;
 
 const WAKER: isize = 0b001;
+#[allow(dead_code)]
 const PARKED: isize = 0b010;
 const SHARED: isize = 0b100;
 
@@ -49,7 +62,7 @@ pin_project! {
     /// the tasks will be [`aborted`](JoinHandle::abort) and the runtime
     /// thread will block until all tasks have dropped.
     pub struct Scope<State: 'static, Rt: Runtime> {
-        handles: Vec<Rt::AbortHandle>,
+        handles: alloc::vec::Vec<Rt::AbortHandle>,
 
         #[pin]
         aliased: Aliasable<SharedState<State>>,
@@ -94,9 +107,20 @@ pin_project! {
             // lock and drop the state.
             let mut lock = aliased.group.lock.lock().unwrap();
             while lock.tasks & REMOVED != 0 {
-                lock.tasks |= PARKED;
-                lock = aliased.group.condvar.wait(lock).unwrap();
-                lock.tasks &= !PARKED;
+                #[cfg(any(loom, feature = "std"))]
+                {
+                    lock.tasks |= PARKED;
+                    lock = aliased.group.condvar.wait(lock).unwrap();
+                    lock.tasks &= !PARKED;
+                }
+
+                #[cfg(not(any(loom, feature = "std")))]
+                {
+                    drop(lock);
+                    core::hint::spin_loop();
+                    lock = aliased.group.lock.lock().unwrap();
+                }
+
                 debug_assert!(lock.tasks != REMOVED, "state should not be dropped");
             }
 
@@ -122,6 +146,7 @@ struct SharedState<State> {
 
 struct LockGroup {
     lock: Mutex<LockState>,
+    #[cfg(any(loom, feature = "std"))]
     condvar: Condvar,
 }
 
@@ -165,7 +190,7 @@ impl LockState {
 impl<State, Rt: Runtime> Future for Scope<State, Rt> {
     type Output = State;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<State> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<State> {
         let this = self.project();
         *this.started_locking = true;
 
@@ -178,7 +203,7 @@ impl<State, Rt: Runtime> Future for Scope<State, Rt> {
             // return pending and register the waker.
             if lock.tasks & REMOVED != 0 {
                 lock.register_waker(cx.waker());
-                return std::task::Poll::Pending;
+                return Poll::Pending;
             }
 
             lock.take_waker();
@@ -197,7 +222,7 @@ impl<State, Rt: Runtime> Future for Scope<State, Rt> {
 
         this.handles.clear();
 
-        std::task::Poll::Ready(state)
+        Poll::Ready(state)
     }
 }
 
@@ -210,13 +235,14 @@ impl<State: 'static + Sync, Rt: Runtime + Default> Scope<State, Rt> {
 impl<State: 'static + Sync, Rt: Runtime> Scope<State, Rt> {
     pub fn with_runtime(state: State, rt: Rt) -> Self {
         Scope {
-            handles: vec![],
+            handles: alloc::vec::Vec::new(),
             aliased: Aliasable::new(SharedState {
                 group: LockGroup {
                     lock: Mutex::new(LockState {
                         waker: MaybeUninit::uninit(),
                         tasks: 0,
                     }),
+                    #[cfg(any(loom, feature = "std"))]
                     condvar: Condvar::new(),
                 },
                 state: ManuallyDropCell::new(state),
@@ -322,6 +348,7 @@ impl<F, S> Drop for ScopedFuture<F, S> {
 
             lock.tasks -= SHARED;
             if lock.tasks & REMOVED == 0 {
+                #[cfg(any(loom, feature = "std"))]
                 if lock.tasks & PARKED == PARKED {
                     self.group.condvar.notify_one();
                 }
@@ -340,10 +367,7 @@ impl<F, S> Drop for ScopedFuture<F, S> {
 impl<F: Future, S> Future for ScopedFuture<F, S> {
     type Output = F::Output;
 
-    fn poll(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // SAFETY: this future is always init until the ScopedFuture is dropped.
         // we also do not move any data.
         let fut = unsafe { self.map_unchecked_mut(|s| &mut *s.future) };
@@ -374,8 +398,9 @@ where
 
 #[cfg(all(test, not(loom), feature = "tokio"))]
 mod tests {
-    use crate::{sync::Mutex, Runtime};
-    use std::{future::Future, pin::pin, task::Context, time::Duration};
+    use crate::Runtime;
+    use core::{future::Future, pin::pin, task::Context, time::Duration};
+    use spin::Mutex;
 
     use futures_util::task::noop_waker_ref;
     use tokio::task::yield_now;
@@ -389,7 +414,7 @@ mod tests {
             async fn call(self, state: &Mutex<u64>) {
                 let i = self.0;
                 tokio::time::sleep(Duration::from_millis(10) * i).await;
-                *state.lock().unwrap() += 1;
+                *state.lock() += 1;
                 tokio::time::sleep(Duration::from_millis(10) * i).await;
             }
         }
@@ -398,7 +423,7 @@ mod tests {
             scoped.as_mut().spawn(Ex(i));
         }
 
-        scoped.await.into_inner().unwrap()
+        scoped.await.into_inner()
     }
 
     #[tokio::test(flavor = "multi_thread")]

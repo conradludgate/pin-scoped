@@ -12,10 +12,14 @@ license = "MIT OR APACHE2"
 
 [features]
 default = []
+std = []
 tokio = ["dep:tokio"]
 
 [dependencies]
 pin-project-lite = "0.2"
+
+# only used for no_std
+spin = { version = "0.9.8", default-features = false, features = ["use_ticket_mutex"] }
 
 tokio = { version = "1.37.0", optional = true, default-features = false, features = ["rt", "rt-multi-thread"] }
 

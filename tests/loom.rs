@@ -38,7 +38,6 @@ fn dropped() {
             let _ = task
                 .as_mut()
                 .poll(&mut Context::from_waker(noop_waker_ref()));
-            loom::thread::yield_now();
         }
 
         rt.shutdown();

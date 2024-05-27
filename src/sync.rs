@@ -1,16 +1,33 @@
 #[cfg(loom)]
 pub use loom::sync::{Condvar, Mutex};
-#[cfg(not(loom))]
+
+// on std, use condvar and mutex
+// on no_std, use spin::Mutex and a fake condvar spinloop
+#[cfg(all(not(loom), feature = "std"))]
 pub use std::sync::{Condvar, Mutex};
 
-#[cfg(not(loom))]
-use std::marker::PhantomData;
-use std::{marker::PhantomPinned, mem::ManuallyDrop, pin::Pin};
+#[cfg(all(not(loom), not(feature = "std")))]
+pub struct Mutex<T>(spin::Mutex<T>);
 
+#[cfg(all(not(loom), not(feature = "std")))]
+impl<T> Mutex<T> {
+    pub fn new(t: T) -> Self {
+        Self(spin::Mutex::new(t))
+    }
+
+    pub fn lock(&self) -> Result<spin::MutexGuard<'_, T>, core::convert::Infallible> {
+        Ok(self.0.lock())
+    }
+}
+
+#[cfg(not(loom))]
+use core::marker::PhantomData;
+use core::{marker::PhantomPinned, mem::ManuallyDrop, pin::Pin};
+
+#[cfg(not(loom))]
+use core::cell::UnsafeCell;
 #[cfg(loom)]
 use loom::cell::UnsafeCell;
-#[cfg(not(loom))]
-use std::cell::UnsafeCell;
 
 pub struct ManuallyDropCell<T> {
     cell: UnsafeCell<ManuallyDrop<T>>,
