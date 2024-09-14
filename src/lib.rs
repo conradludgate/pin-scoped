@@ -39,6 +39,70 @@ const SHARED_MASK: usize = !SHARED + 1;
 // /// The state is exclusively acquired from the scope
 // const EXCLUSIVE: usize = -1;
 
+struct SharedState<State> {
+    group: LockGroup,
+    /// initialised if and only if group.lock.tasks != [`REMOVED`]
+    state: ManuallyDropCell<State>,
+}
+
+struct LockGroup {
+    lock: Mutex<LockState>,
+    condvar: Condvar,
+}
+
+struct LockState {
+    /// positive for read-only tasks
+    /// [`isize::MIN`] for a single mut task
+    /// -1 for when the state is removed
+    tasks: usize,
+
+    /// Set when [`WAKER`] bit of `tasks` is set.
+    waker: MaybeUninit<Waker>,
+
+    /// The list of currently active tasks
+    cancel_list: SlotMap<DefaultKey, Option<AbortHandle>>,
+}
+
+impl LockState {
+    fn drop_waker(&mut self) {
+        // drop the waker if it's set.
+        if self.tasks & WAKER == WAKER {
+            // unset the bit
+            self.tasks &= !WAKER;
+
+            // SAFETY: the waker bit was set, so this is init
+            unsafe {
+                MaybeUninit::assume_init_drop(&mut self.waker);
+            }
+        }
+    }
+
+    fn take_waker(&mut self) -> Option<Waker> {
+        // take the waker if it's set.
+        if self.tasks & WAKER == WAKER {
+            // unset the bit
+            self.tasks &= !WAKER;
+
+            // SAFETY: the waker bit was set, so this is init
+            unsafe { Some(MaybeUninit::assume_init_read(&self.waker)) }
+        } else {
+            None
+        }
+    }
+
+    fn register_waker(&mut self, waker: &Waker) {
+        // the waker is set.
+        if self.tasks & WAKER == WAKER {
+            // SAFETY: the waker bit was set, so this is init
+            unsafe { MaybeUninit::assume_init_mut(&mut self.waker).clone_from(waker) }
+        } else {
+            // set the waker bit
+            self.tasks |= WAKER;
+            self.waker.write(waker.clone());
+        }
+    }
+}
+
 pin_project! {
     /// Scope represents a scope holding some values.
     ///
@@ -73,21 +137,27 @@ pin_project! {
 
             lock.tasks |= CLOSED; // mark as closed.
 
+            // abort the tasks that are still in flight
             for (_, handle) in &mut lock.cancel_list {
                 if let Some(handle) = handle.take() {
                     handle.abort();
                 }
             }
 
+            // wait until there are no tasks left holding the shared lock
             if lock.tasks & SHARED_MASK != 0 {
                 lock = block_in_place(move || {
                     loop {
+                        // set parked bit
                         lock.tasks |= PARKED;
 
+                        // park
                         lock = aliased.group.condvar.wait(lock).unwrap();
 
+                        // unset parked bit
                         lock.tasks &= !PARKED;
 
+                        // exit if no more tasks are holding the shared lock
                         if lock.tasks & SHARED_MASK == 0 {
                             break lock;
                         }
@@ -95,8 +165,9 @@ pin_project! {
                 });
             }
 
-            _ = lock.take_waker();
+            lock.drop_waker();
 
+            debug_assert!(lock.cancel_list.is_empty());
             debug_assert!(lock.tasks & REMOVED == 0, "state should not be dropped");
             lock.tasks |= REMOVED;
 
@@ -106,57 +177,6 @@ pin_project! {
             unsafe { aliased.state.drop() };
 
             drop(lock);
-        }
-    }
-}
-
-struct SharedState<State> {
-    group: LockGroup,
-    /// initialised if and only if group.lock.tasks != [`REMOVED`]
-    state: ManuallyDropCell<State>,
-}
-
-struct LockGroup {
-    lock: Mutex<LockState>,
-    condvar: Condvar,
-}
-
-struct LockState {
-    /// positive for read-only tasks
-    /// [`isize::MIN`] for a single mut task
-    /// -1 for when the state is removed
-    tasks: usize,
-
-    /// Set when [`WAKER`] bit of `tasks` is set.
-    waker: MaybeUninit<Waker>,
-
-    /// The list of currently active tasks
-    cancel_list: SlotMap<DefaultKey, Option<AbortHandle>>,
-}
-
-impl LockState {
-    fn take_waker(&mut self) -> Option<Waker> {
-        // drop the waker if it's set.
-        if self.tasks & WAKER == WAKER {
-            // unset the bit
-            self.tasks &= !WAKER;
-
-            // SAFETY: the waker bit was set, so this is init
-            unsafe { Some(MaybeUninit::assume_init_read(&self.waker)) }
-        } else {
-            None
-        }
-    }
-
-    fn register_waker(&mut self, waker: &Waker) {
-        // the waker is set.
-        if self.tasks & WAKER == WAKER {
-            // SAFETY: the waker bit was set, so this is init
-            unsafe { MaybeUninit::assume_init_mut(&mut self.waker).clone_from(waker) }
-        } else {
-            // set the waker bit
-            self.tasks |= WAKER;
-            self.waker.write(waker.clone());
         }
     }
 }
@@ -180,10 +200,9 @@ impl<State> Future for Scope<State> {
                 return Poll::Pending;
             }
 
+            lock.drop_waker();
+
             debug_assert!(lock.cancel_list.is_empty());
-
-            lock.take_waker();
-
             debug_assert!(lock.tasks & REMOVED == 0, "state should not be dropped");
             lock.tasks |= REMOVED;
 
