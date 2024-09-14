@@ -21,7 +21,7 @@ pub struct ManuallyDropCell<T> {
 
 impl<T> ManuallyDropCell<T> {
     pub fn new(t: T) -> Self {
-        ManuallyDropCell {
+        Self {
             cell: UnsafeCell::new(ManuallyDrop::new(t)),
         }
     }
@@ -42,7 +42,7 @@ impl<T> ManuallyDropCell<T> {
         };
         #[cfg(not(pin_scoped_loom))]
         unsafe {
-            ManuallyDrop::drop(&mut *self.cell.get())
+            ManuallyDrop::drop(&mut *self.cell.get());
         };
     }
 
@@ -69,6 +69,7 @@ pub struct GuardPtr<T>(Option<loom::cell::ConstPtr<T>>);
 unsafe impl<T> Send for GuardPtr<T> {}
 
 impl<T> GuardPtr<T> {
+    #[cfg_attr(not(pin_scoped_loom), allow(clippy::unused_self))]
     pub fn release(&mut self) {
         #[cfg(pin_scoped_loom)]
         {
@@ -88,7 +89,7 @@ impl<T> Aliasable<T> {
     /// Create a new `Aliasable` that stores `val`.
     #[must_use]
     #[inline]
-    pub fn new(val: T) -> Self {
+    pub const fn new(val: T) -> Self {
         Self {
             val,
             _pinned: PhantomPinned,

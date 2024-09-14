@@ -1,4 +1,5 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![warn(clippy::significant_drop_tightening)]
 
 use pin_project_lite::pin_project;
 use std::future::Future;
@@ -72,7 +73,7 @@ pin_project! {
 
             lock.tasks |= CLOSED; // mark as closed.
 
-            for (_, handle) in lock.cancel_list.iter_mut() {
+            for (_, handle) in &mut lock.cancel_list {
                 if let Some(handle) = handle.take() {
                     handle.abort();
                 }
@@ -103,6 +104,8 @@ pin_project! {
             // 0 tasks means we have exclusive access to state now.
             // and it is currently initialised.
             unsafe { aliased.state.drop() };
+
+            drop(lock);
         }
     }
 }
@@ -120,7 +123,7 @@ struct LockGroup {
 
 struct LockState {
     /// positive for read-only tasks
-    /// isize::MIN for a single mut task
+    /// [`isize::MIN`] for a single mut task
     /// -1 for when the state is removed
     tasks: usize,
 
@@ -187,7 +190,11 @@ impl<State> Future for Scope<State> {
             // SAFETY:
             // 0 tasks means we have exclusive access to state now.
             // and it is currently initialised.
-            unsafe { aliased.state.take() }
+            let state = unsafe { aliased.state.take() };
+
+            drop(lock);
+
+            state
         };
 
         Poll::Ready(state)
@@ -196,13 +203,13 @@ impl<State> Future for Scope<State> {
 
 impl<State: 'static + Sync> Scope<State> {
     pub fn new(state: State) -> Self {
-        Scope::with_runtime(state, Handle::current())
+        Self::with_runtime(state, Handle::current())
     }
 }
 
 impl<State: 'static + Sync> Scope<State> {
     pub fn with_runtime(state: State, rt: Handle) -> Self {
-        Scope {
+        Self {
             aliased: Aliasable::new(SharedState {
                 group: LockGroup {
                     lock: Mutex::new(LockState {
@@ -248,9 +255,10 @@ impl<State: 'static + Sync> Scope<State> {
     {
         let this = self.project();
 
-        if *this.started_locking {
-            panic!("spawn should not be called after awaiting the Scope handle")
-        }
+        assert!(
+            !*this.started_locking,
+            "spawn should not be called after awaiting the Scope handle"
+        );
 
         // SAFETY:
         // 1. `state` cannot outlive the returned futures.
@@ -276,7 +284,6 @@ impl<State: 'static + Sync> Scope<State> {
         let inner = ScopeGuard {
             group: &state.group,
             task_key,
-            // cancel_node: pin_list::Node::new(),
         };
 
         let handle = this.runtime.spawn(ScopedFuture {
@@ -286,9 +293,12 @@ impl<State: 'static + Sync> Scope<State> {
         });
 
         // fill in abort handle
-        let mut lock = state.group.lock.lock().unwrap();
-        if let Some(handle_slot) = lock.cancel_list.get_mut(task_key) {
-            *handle_slot = Some(handle.abort_handle());
+        {
+            let mut lock = state.group.lock.lock().unwrap();
+            if let Some(handle_slot) = lock.cancel_list.get_mut(task_key) {
+                *handle_slot = Some(handle.abort_handle());
+            }
+            drop(lock);
         }
 
         handle
@@ -325,7 +335,6 @@ impl Drop for ScopeGuard {
 
 pin_project! {
     struct ScopedFuture<F, S> {
-        #[pin]
         inner: ScopeGuard,
         #[pin]
         future: ManuallyDrop<F>,
@@ -382,21 +391,21 @@ mod tests {
     use std::{future::Future, pin::pin, sync::Mutex, task::Context, time::Duration};
 
     use futures_util::task::noop_waker_ref;
-    use tokio::task::yield_now;
 
     use crate::Scope;
 
+    struct Ex(u32);
+    impl super::AsyncFnOnceRef<Mutex<u64>, ()> for Ex {
+        async fn call(self, state: &Mutex<u64>) {
+            let i = self.0;
+            tokio::time::sleep(Duration::from_millis(10) * i).await;
+            *state.lock().unwrap() += 1;
+            tokio::time::sleep(Duration::from_millis(10) * i).await;
+        }
+    }
+
     async fn run(n: u32) -> u64 {
         let mut scoped = pin!(Scope::new(Mutex::new(0)));
-        struct Ex(u32);
-        impl super::AsyncFnOnceRef<Mutex<u64>, ()> for Ex {
-            async fn call(self, state: &Mutex<u64>) {
-                let i = self.0;
-                tokio::time::sleep(Duration::from_millis(10) * i).await;
-                *state.lock().unwrap() += 1;
-                tokio::time::sleep(Duration::from_millis(10) * i).await;
-            }
-        }
 
         for i in 0..n {
             scoped.as_mut().spawn(Ex(i));
@@ -405,18 +414,31 @@ mod tests {
         scoped.await.into_inner().unwrap()
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn scoped() {
-        assert_eq!(run(64).await, 64);
+    #[test]
+    fn scoped() {
+        let res = tokio::runtime::Builder::new_multi_thread()
+            .enable_time()
+            .worker_threads(1)
+            .build()
+            .unwrap()
+            .block_on(run(64));
+
+        assert_eq!(res, 64);
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn dropped() {
+    #[test]
+    fn dropped() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_time()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+
         let mut task = pin!(run(64));
         assert!(task
             .as_mut()
             .poll(&mut Context::from_waker(noop_waker_ref()))
             .is_pending());
-        yield_now().await;
     }
 }
