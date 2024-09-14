@@ -1,8 +1,4 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
-#![no_std]
-
-#[cfg(feature = "std")]
-extern crate std;
 
 use core::future::Future;
 use core::mem::MaybeUninit;
@@ -12,28 +8,7 @@ use core::{mem::ManuallyDrop, pin::Pin, task::Waker};
 use pin_project_lite::pin_project;
 
 mod sync;
-use sync::{Aliasable, GuardPtr, ManuallyDropCell, Mutex};
-
-#[cfg(any(loom, feature = "std"))]
-use sync::Condvar;
-
-#[cfg(feature = "tokio")]
-pub mod tokio;
-#[cfg(feature = "tokio")]
-pub type TokioScope<State> = Scope<State, tokio::Global>;
-
-pub trait Runtime {
-    type JoinHandle<R>;
-
-    fn spawn<F>(&self, future: F) -> Self::JoinHandle<F::Output>
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static;
-
-    fn block_in_place<F, R>(f: F) -> R
-    where
-        F: FnOnce() -> R;
-}
+use sync::{Aliasable, Condvar, GuardPtr, ManuallyDropCell, Mutex};
 
 // The waker is set
 const WAKER: usize = 0b00001;
@@ -59,16 +34,16 @@ pin_project! {
     /// Should the scope be dropped before those tasks complete,
     /// the tasks will be [`aborted`](JoinHandle::abort) and the runtime
     /// thread will block until all tasks have dropped.
-    pub struct Scope<State: 'static, Rt: Runtime> {
+    pub struct Scope<State: 'static> {
         #[pin]
         aliased: Aliasable<SharedState<State>>,
 
         started_locking: bool,
 
-        runtime: Rt,
+        runtime: tokio::runtime::Handle,
     }
 
-    impl<State: 'static, Rt: Runtime> PinnedDrop for Scope<State, Rt> {
+    impl<State: 'static> PinnedDrop for Scope<State> {
         #[inline(never)]
         fn drop(this: Pin<&mut Self>) {
             let this = this.project();
@@ -94,18 +69,7 @@ pin_project! {
             while lock.tasks & SHARED_MASK != 0 {
                 lock.tasks |= PARKED;
 
-                #[cfg(any(loom, feature = "std"))]
-                {
-                    lock = aliased.group.condvar.wait(lock).unwrap();
-                }
-
-                // best we can do is spin on no_std
-                #[cfg(not(any(loom, feature = "std")))]
-                {
-                    drop(lock);
-                    core::hint::spin_loop();
-                    lock = aliased.group.lock.lock().unwrap();
-                }
+                lock = aliased.group.condvar.wait(lock).unwrap();
 
                 lock.tasks &= !PARKED;
             }
@@ -131,7 +95,6 @@ struct SharedState<State> {
 
 struct LockGroup {
     lock: Mutex<LockState>,
-    #[cfg(any(loom, feature = "std"))]
     condvar: Condvar,
 }
 
@@ -175,7 +138,7 @@ impl LockState {
     }
 }
 
-impl<State, Rt: Runtime> Future for Scope<State, Rt> {
+impl<State> Future for Scope<State> {
     type Output = State;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<State> {
@@ -211,14 +174,14 @@ impl<State, Rt: Runtime> Future for Scope<State, Rt> {
     }
 }
 
-impl<State: 'static + Sync, Rt: Runtime + Default> Scope<State, Rt> {
+impl<State: 'static + Sync> Scope<State> {
     pub fn new(state: State) -> Self {
-        Scope::with_runtime(state, Rt::default())
+        Scope::with_runtime(state, tokio::runtime::Handle::current())
     }
 }
 
-impl<State: 'static + Sync, Rt: Runtime> Scope<State, Rt> {
-    pub fn with_runtime(state: State, rt: Rt) -> Self {
+impl<State: 'static + Sync> Scope<State> {
+    pub fn with_runtime(state: State, rt: tokio::runtime::Handle) -> Self {
         Scope {
             aliased: Aliasable::new(SharedState {
                 group: LockGroup {
@@ -227,7 +190,6 @@ impl<State: 'static + Sync, Rt: Runtime> Scope<State, Rt> {
                         tasks: 0,
                         cancel_list: pin_list::PinList::new(pin_list::id::Checked::new()),
                     }),
-                    #[cfg(any(loom, feature = "std"))]
                     condvar: Condvar::new(),
                 },
                 state: ManuallyDropCell::new(state),
@@ -264,7 +226,7 @@ impl<State: 'static + Sync, Rt: Runtime> Scope<State, Rt> {
     ///
     /// * Panics if called from **outside** of the Tokio runtime.
     /// * Panics if called after **awaiting** `Scope`
-    pub fn spawn<F, R>(self: Pin<&mut Self>, f: F) -> Rt::JoinHandle<Result<R, Cancelled>>
+    pub fn spawn<F, R>(self: Pin<&mut Self>, f: F) -> tokio::task::JoinHandle<Result<R, Cancelled>>
     where
         F: AsyncFnOnceRef<State, R> + 'static,
         R: Send + 'static,
@@ -338,7 +300,6 @@ pin_project! {
 
                 lock.tasks -= SHARED;
                 if lock.tasks & SHARED_MASK == 0 {
-                    #[cfg(any(loom, feature = "std"))]
                     if lock.tasks & PARKED == PARKED {
                         this.group.condvar.notify_one();
                     }
@@ -366,13 +327,14 @@ impl ScopeGuard {
             {
                 return Err(Cancelled(()));
             }
+
             // Problem:
             // If the waker changes between polls, this behaves poorly.
             // however, I don't know any popular executors that don't
-            // use the same waker per top-level task poll.
-            // init.protected_mut(&mut self.project().lock.lock().unwrap().cancel_list).clone_from(cx.waker())
-            // not, this does not make this crate unsound, it just delays the cancellation of the task, potentially
-            // indefinitely. oh well.
+            // use the same waker per top-level task poll. Note, this does not make this crate unsound,
+            // it just delays the cancellation of the task, potentially indefinitely. oh well.
+            // TODO: maybe look into diatomic_waker
+            // `init.protected_mut(&mut self.project().lock.lock().unwrap().cancel_list).clone_from(cx.waker())`
         } else {
             self.init_cancellation_node(cx)?;
         }
@@ -440,7 +402,6 @@ impl core::fmt::Display for Cancelled {
     }
 }
 
-#[cfg(feature = "std")]
 impl std::error::Error for Cancelled {}
 
 pub trait AsyncFnOnceRef<S, R> {
@@ -464,25 +425,24 @@ where
     }
 }
 
-#[cfg(all(test, not(loom), feature = "tokio"))]
+#[cfg(all(test, not(loom)))]
 mod tests {
-    use crate::Runtime;
     use core::{future::Future, pin::pin, task::Context, time::Duration};
-    use spin::Mutex;
+    use std::sync::Mutex;
 
     use futures_util::task::noop_waker_ref;
     use tokio::task::yield_now;
 
     use crate::Scope;
 
-    async fn run(n: u32, rt: impl Runtime) -> u64 {
-        let mut scoped = pin!(Scope::with_runtime(Mutex::new(0), rt));
+    async fn run(n: u32) -> u64 {
+        let mut scoped = pin!(Scope::new(Mutex::new(0)));
         struct Ex(u32);
         impl super::AsyncFnOnceRef<Mutex<u64>, ()> for Ex {
             async fn call(self, state: &Mutex<u64>) {
                 let i = self.0;
                 tokio::time::sleep(Duration::from_millis(10) * i).await;
-                *state.lock() += 1;
+                *state.lock().unwrap() += 1;
                 tokio::time::sleep(Duration::from_millis(10) * i).await;
             }
         }
@@ -491,17 +451,17 @@ mod tests {
             scoped.as_mut().spawn(Ex(i));
         }
 
-        scoped.await.into_inner()
+        scoped.await.into_inner().unwrap()
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn scoped() {
-        assert_eq!(run(64, crate::tokio::Global).await, 64);
+        assert_eq!(run(64).await, 64);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn dropped() {
-        let mut task = pin!(run(64, crate::tokio::Global));
+        let mut task = pin!(run(64));
         assert!(task
             .as_mut()
             .poll(&mut Context::from_waker(noop_waker_ref()))

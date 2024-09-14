@@ -3,22 +3,8 @@ pub use loom::sync::{Condvar, Mutex};
 
 // on std, use condvar and mutex
 // on no_std, use spin::Mutex and a fake condvar spinloop
-#[cfg(all(not(loom), feature = "std"))]
+#[cfg(not(loom))]
 pub use std::sync::{Condvar, Mutex};
-
-#[cfg(all(not(loom), not(feature = "std")))]
-pub struct Mutex<T>(spin::Mutex<T>);
-
-#[cfg(all(not(loom), not(feature = "std")))]
-impl<T> Mutex<T> {
-    pub fn new(t: T) -> Self {
-        Self(spin::Mutex::new(t))
-    }
-
-    pub fn lock(&self) -> Result<spin::MutexGuard<'_, T>, core::convert::Infallible> {
-        Ok(self.0.lock())
-    }
-}
 
 #[cfg(not(loom))]
 use core::marker::PhantomData;
