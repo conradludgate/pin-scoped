@@ -1,3 +1,5 @@
+#![cfg(not(any(miri, pin_scoped_loom)))]
+
 use std::{
     pin::pin,
     sync::{atomic::AtomicUsize, Arc},

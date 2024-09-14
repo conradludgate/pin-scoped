@@ -1,20 +1,19 @@
-#![cfg(loom)]
+#![cfg(pin_scoped_loom)]
 
-use futures_util::{future::BoxFuture, task::noop_waker_ref, FutureExt};
-use loom::sync::{Arc, Mutex};
+use futures_util::task::noop_waker_ref;
+use loom::sync::Mutex;
+use pin_scoped::loom_rt::Handle;
+use pin_scoped::Scope;
 use std::{
     future::{poll_fn, Future},
-    marker::PhantomData,
     pin::pin,
-    task::{Context, Waker},
+    task::Context,
 };
-
-use pin_scoped::{Runtime, Scope};
 
 #[test]
 fn scoped() {
     loom::model(|| {
-        let rt = Rt::default();
+        let rt = Handle::current();
 
         let worker_thread = rt.spawn_worker();
 
@@ -29,7 +28,7 @@ fn scoped() {
 #[test]
 fn dropped() {
     loom::model(|| {
-        let rt = Rt::default();
+        let rt = Handle::current();
 
         let worker_thread = rt.spawn_worker();
 
@@ -45,7 +44,7 @@ fn dropped() {
     });
 }
 
-async fn run(n: u32, rt: impl Runtime) -> u64 {
+async fn run(n: u32, rt: Handle) -> u64 {
     let mut scoped = pin!(Scope::with_runtime(Mutex::new(0), rt));
     struct Ex;
     impl pin_scoped::AsyncFnOnceRef<Mutex<u64>, ()> for Ex {
@@ -61,121 +60,6 @@ async fn run(n: u32, rt: impl Runtime) -> u64 {
     }
 
     scoped.await.into_inner().unwrap()
-}
-
-struct AsyncChannelInner<T> {
-    messages: Vec<T>,
-    // waker for the recv
-    waker: Option<Waker>,
-    closed: bool,
-}
-
-impl<T> Default for AsyncChannelInner<T> {
-    fn default() -> Self {
-        AsyncChannelInner {
-            messages: Default::default(),
-            waker: Default::default(),
-            closed: Default::default(),
-        }
-    }
-}
-
-/// a really dumb async channel that is safe to use with loom
-struct AsyncChannel<T> {
-    inner: Arc<Mutex<AsyncChannelInner<T>>>,
-}
-impl<T> Default for AsyncChannel<T> {
-    fn default() -> Self {
-        AsyncChannel {
-            inner: Default::default(),
-        }
-    }
-}
-impl<T> Clone for AsyncChannel<T> {
-    fn clone(&self) -> Self {
-        AsyncChannel {
-            inner: self.inner.clone(),
-        }
-    }
-}
-
-#[derive(Default, Clone)]
-struct Rt {
-    task_queue: AsyncChannel<BoxFuture<'static, ()>>,
-}
-
-impl Runtime for Rt {
-    type JoinHandle<R> = PhantomData<R>;
-
-    fn spawn<F>(&self, future: F) -> Self::JoinHandle<F::Output>
-    where
-        F: futures_util::Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        let mut queue = self.task_queue.inner.lock().unwrap();
-        queue.messages.push(
-            async move {
-                future.await;
-            }
-            .boxed(),
-        );
-        if let Some(waker) = queue.waker.take() {
-            waker.wake();
-        }
-        PhantomData
-    }
-
-    fn block_in_place<F, R>(f: F) -> R
-    where
-        F: FnOnce() -> R,
-    {
-        f()
-    }
-}
-
-impl Rt {
-    fn spawn_worker(&self) -> loom::thread::JoinHandle<()> {
-        let queue = self.task_queue.clone();
-        let mut futures = Vec::<BoxFuture<'static, ()>>::new();
-        loom::thread::spawn(move || {
-            loom::future::block_on(poll_fn(|cx| {
-                let done = {
-                    let mut tasks = queue.inner.lock().unwrap();
-                    tasks.waker = Some(cx.waker().clone());
-
-                    for task in tasks.messages.drain(..) {
-                        futures.push(task);
-                    }
-
-                    tasks.closed
-                };
-
-                let mut i = 0;
-                while i < futures.len() {
-                    match futures[i].poll_unpin(cx) {
-                        std::task::Poll::Pending => i += 1,
-                        std::task::Poll::Ready(()) => {
-                            drop(futures.remove(i));
-                        }
-                    }
-                }
-
-                if done && futures.is_empty() {
-                    std::task::Poll::Ready(())
-                } else {
-                    std::task::Poll::Pending
-                }
-            }))
-        })
-    }
-
-    fn shutdown(&self) {
-        let mut queue = self.task_queue.inner.lock().unwrap();
-        queue.closed = true;
-        if let Some(waker) = queue.waker.take() {
-            waker.wake();
-        }
-    }
 }
 
 async fn yield_now() {

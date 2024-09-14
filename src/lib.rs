@@ -7,9 +7,20 @@ use std::task::{Context, Poll};
 use std::{mem::ManuallyDrop, pin::Pin, task::Waker};
 
 mod sync;
+
+#[cfg(pin_scoped_loom)]
+pub mod loom_rt;
+#[cfg(pin_scoped_loom)]
+use loom_rt::{block_in_place, AbortHandle, Handle, JoinHandle};
+
+#[cfg(not(pin_scoped_loom))]
+use tokio::{
+    runtime::Handle,
+    task::{block_in_place, AbortHandle, JoinHandle},
+};
+
 use slotmap::{DefaultKey, SlotMap};
 use sync::{Aliasable, Condvar, GuardPtr, ManuallyDropCell, Mutex};
-use tokio::task::AbortHandle;
 
 // The waker is set
 const WAKER: usize = 0b00001;
@@ -41,7 +52,7 @@ pin_project! {
 
         started_locking: bool,
 
-        runtime: tokio::runtime::Handle,
+        runtime: Handle,
     }
 
     impl<State: 'static> PinnedDrop for Scope<State> {
@@ -67,12 +78,20 @@ pin_project! {
                 }
             }
 
-            while lock.tasks & SHARED_MASK != 0 {
-                lock.tasks |= PARKED;
+            if lock.tasks & SHARED_MASK != 0 {
+                lock = block_in_place(move || {
+                    loop {
+                        lock.tasks |= PARKED;
 
-                lock = aliased.group.condvar.wait(lock).unwrap();
+                        lock = aliased.group.condvar.wait(lock).unwrap();
 
-                lock.tasks &= !PARKED;
+                        lock.tasks &= !PARKED;
+
+                        if lock.tasks & SHARED_MASK == 0 {
+                            break lock;
+                        }
+                    }
+                });
             }
 
             _ = lock.take_waker();
@@ -177,12 +196,12 @@ impl<State> Future for Scope<State> {
 
 impl<State: 'static + Sync> Scope<State> {
     pub fn new(state: State) -> Self {
-        Scope::with_runtime(state, tokio::runtime::Handle::current())
+        Scope::with_runtime(state, Handle::current())
     }
 }
 
 impl<State: 'static + Sync> Scope<State> {
-    pub fn with_runtime(state: State, rt: tokio::runtime::Handle) -> Self {
+    pub fn with_runtime(state: State, rt: Handle) -> Self {
         Scope {
             aliased: Aliasable::new(SharedState {
                 group: LockGroup {
@@ -200,8 +219,7 @@ impl<State: 'static + Sync> Scope<State> {
         }
     }
 
-    /// Spawns a new asynchronous task, returning a
-    /// [`JoinHandle`] for it.
+    /// Spawns a new asynchronous task, returning a [`JoinHandle`] for it.
     ///
     /// The provided future will start running in the background immediately
     /// when `spawn` is called, even if you don't await the returned
@@ -219,15 +237,11 @@ impl<State: 'static + Sync> Scope<State> {
     /// When a runtime is shutdown, all outstanding tasks are dropped,
     /// regardless of the lifecycle of that task.
     ///
-    /// This function must be called from the context of a Tokio runtime. Tasks running on
-    /// the Tokio runtime are always inside its context, but you can also enter the context
-    /// using the [`Runtime::enter`](crate::runtime::Runtime::enter()) method.
-    ///
     /// # Panics
     ///
     /// * Panics if called from **outside** of the Tokio runtime.
     /// * Panics if called after **awaiting** `Scope`
-    pub fn spawn<F, R>(self: Pin<&mut Self>, f: F) -> tokio::task::JoinHandle<Result<R, Cancelled>>
+    pub fn spawn<F, R>(self: Pin<&mut Self>, f: F) -> JoinHandle<R>
     where
         F: AsyncFnOnceRef<State, R> + 'static,
         R: Send + 'static,
@@ -331,27 +345,16 @@ pin_project! {
 }
 
 impl<F: Future, S> Future for ScopedFuture<F, S> {
-    type Output = Result<F::Output, Cancelled>;
+    type Output = F::Output;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
 
         // SAFETY: future is always init and we do not move anything
         let future = unsafe { this.future.map_unchecked_mut(|f| &mut **f) };
-        future.poll(cx).map(Ok)
+        future.poll(cx)
     }
 }
-
-#[derive(Debug)]
-pub struct Cancelled(());
-
-impl std::fmt::Display for Cancelled {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the task was cancelled")
-    }
-}
-
-impl std::error::Error for Cancelled {}
 
 pub trait AsyncFnOnceRef<S, R> {
     fn call(self, state: &S) -> impl Send + Future<Output = R>;
@@ -374,7 +377,7 @@ where
     }
 }
 
-#[cfg(all(test, not(loom)))]
+#[cfg(all(test, not(pin_scoped_loom)))]
 mod tests {
     use std::{future::Future, pin::pin, sync::Mutex, task::Context, time::Duration};
 

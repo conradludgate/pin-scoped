@@ -1,18 +1,18 @@
-#[cfg(loom)]
+#[cfg(pin_scoped_loom)]
 pub use loom::sync::{Condvar, Mutex};
 
 // on std, use condvar and mutex
 // on no_std, use spin::Mutex and a fake condvar spinloop
-#[cfg(not(loom))]
+#[cfg(not(pin_scoped_loom))]
 pub use std::sync::{Condvar, Mutex};
 
-#[cfg(not(loom))]
+#[cfg(not(pin_scoped_loom))]
 use core::marker::PhantomData;
 use core::{marker::PhantomPinned, mem::ManuallyDrop, pin::Pin};
 
-#[cfg(not(loom))]
+#[cfg(not(pin_scoped_loom))]
 use core::cell::UnsafeCell;
-#[cfg(loom)]
+#[cfg(pin_scoped_loom)]
 use loom::cell::UnsafeCell;
 
 pub struct ManuallyDropCell<T> {
@@ -27,20 +27,20 @@ impl<T> ManuallyDropCell<T> {
     }
 
     pub unsafe fn take(&self) -> T {
-        #[cfg(loom)]
+        #[cfg(pin_scoped_loom)]
         let state = unsafe { self.cell.with_mut(|s| ManuallyDrop::take(&mut *s)) };
-        #[cfg(not(loom))]
+        #[cfg(not(pin_scoped_loom))]
         let state = unsafe { ManuallyDrop::take(&mut *self.cell.get()) };
 
         state
     }
 
     pub unsafe fn drop(&self) {
-        #[cfg(loom)]
+        #[cfg(pin_scoped_loom)]
         unsafe {
             self.cell.with_mut(|s| ManuallyDrop::drop(&mut *s))
         };
-        #[cfg(not(loom))]
+        #[cfg(not(pin_scoped_loom))]
         unsafe {
             ManuallyDrop::drop(&mut *self.cell.get())
         };
@@ -49,19 +49,19 @@ impl<T> ManuallyDropCell<T> {
     pub unsafe fn borrow<'a>(&self) -> (&'a T, GuardPtr<ManuallyDrop<T>>) {
         let ptr = self.cell.get();
 
-        #[cfg(loom)]
+        #[cfg(pin_scoped_loom)]
         let ret = (ptr.with(|p| unsafe { &**p }), GuardPtr(Some(ptr)));
-        #[cfg(not(loom))]
+        #[cfg(not(pin_scoped_loom))]
         let ret = (unsafe { &**ptr }, GuardPtr(PhantomData));
 
         ret
     }
 }
 
-#[cfg(not(loom))]
+#[cfg(not(pin_scoped_loom))]
 pub struct GuardPtr<T>(PhantomData<*const T>);
 
-#[cfg(loom)]
+#[cfg(pin_scoped_loom)]
 pub struct GuardPtr<T>(Option<loom::cell::ConstPtr<T>>);
 
 // Safety:
@@ -70,7 +70,7 @@ unsafe impl<T> Send for GuardPtr<T> {}
 
 impl<T> GuardPtr<T> {
     pub fn release(&mut self) {
-        #[cfg(loom)]
+        #[cfg(pin_scoped_loom)]
         {
             self.0 = None;
         }
