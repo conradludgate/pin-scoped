@@ -1,14 +1,15 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
-use core::future::Future;
-use core::mem::MaybeUninit;
-use core::sync::atomic::AtomicBool;
-use core::task::{Context, Poll};
-use core::{mem::ManuallyDrop, pin::Pin, task::Waker};
 use pin_project_lite::pin_project;
+use std::future::Future;
+use std::mem::MaybeUninit;
+use std::task::{Context, Poll};
+use std::{mem::ManuallyDrop, pin::Pin, task::Waker};
 
 mod sync;
+use slotmap::{DefaultKey, SlotMap};
 use sync::{Aliasable, Condvar, GuardPtr, ManuallyDropCell, Mutex};
+use tokio::task::AbortHandle;
 
 // The waker is set
 const WAKER: usize = 0b00001;
@@ -60,10 +61,10 @@ pin_project! {
 
             lock.tasks |= CLOSED; // mark as closed.
 
-            let mut cancel_cursor = lock.cancel_list.cursor_front_mut();
-            while let Some(head) = cancel_cursor.unprotected() {
-                head.store(true, core::sync::atomic::Ordering::Release);
-                cancel_cursor.remove_current(()).unwrap().wake();
+            for (_, handle) in lock.cancel_list.iter_mut() {
+                if let Some(handle) = handle.take() {
+                    handle.abort();
+                }
             }
 
             while lock.tasks & SHARED_MASK != 0 {
@@ -108,7 +109,7 @@ struct LockState {
     waker: MaybeUninit<Waker>,
 
     /// The list of currently active tasks
-    cancel_list: pin_list::PinList<CancelTypes>,
+    cancel_list: SlotMap<DefaultKey, Option<AbortHandle>>,
 }
 
 impl LockState {
@@ -188,7 +189,7 @@ impl<State: 'static + Sync> Scope<State> {
                     lock: Mutex::new(LockState {
                         waker: MaybeUninit::uninit(),
                         tasks: 0,
-                        cancel_list: pin_list::PinList::new(pin_list::id::Checked::new()),
+                        cancel_list: SlotMap::new(),
                     }),
                     condvar: Condvar::new(),
                 },
@@ -243,14 +244,15 @@ impl<State: 'static + Sync> Scope<State> {
         let state = unsafe { this.aliased.as_ref().get_extended() };
 
         // acquire the shared access lock
-        {
+        let task_key = {
             let mut lock = state.group.lock.lock().unwrap();
             let Some(tasks) = lock.tasks.checked_add(SHARED) else {
                 // takes some very strange system to achieve this.
                 panic!("number of active exceeded maximum")
             };
             lock.tasks = tasks;
-        }
+            lock.cancel_list.insert(None)
+        };
 
         // SAFETY:
         // state will stay valid for shared access until the returned future gets dropped.
@@ -259,103 +261,51 @@ impl<State: 'static + Sync> Scope<State> {
 
         let inner = ScopeGuard {
             group: &state.group,
-            cancel_node: pin_list::Node::new(),
+            task_key,
+            // cancel_node: pin_list::Node::new(),
         };
 
-        this.runtime.spawn(ScopedFuture {
+        let handle = this.runtime.spawn(ScopedFuture {
             inner,
             future: ManuallyDrop::new(future),
             ptr_guard,
-        })
+        });
+
+        // fill in abort handle
+        let mut lock = state.group.lock.lock().unwrap();
+        if let Some(handle_slot) = lock.cancel_list.get_mut(task_key) {
+            *handle_slot = Some(handle.abort_handle());
+        }
+
+        handle
     }
 }
 
-type CancelTypes = dyn pin_list::Types<
-    Id = pin_list::id::Checked,
-    Protected = Waker,
-    Removed = (),
-    Unprotected = AtomicBool,
->;
-
-pin_project! {
-    struct ScopeGuard {
-        group: &'static LockGroup,
-        #[pin]
-        cancel_node: pin_list::Node<CancelTypes>,
-    }
-
-    impl PinnedDrop for ScopeGuard {
-        fn drop(this: Pin<&mut Self>) {
-            let this = this.project();
-
-            // false positive clippy warning
-            #[allow(clippy::mut_mutex_lock)]
-            let waker = {
-                let mut lock = this.group.lock.lock().unwrap();
-
-                if let Some(init) = this.cancel_node.initialized_mut() {
-                    // detach it
-                    _ = init.reset(&mut lock.cancel_list);
-                }
-
-                lock.tasks -= SHARED;
-                if lock.tasks & SHARED_MASK == 0 {
-                    if lock.tasks & PARKED == PARKED {
-                        this.group.condvar.notify_one();
-                    }
-                    lock.take_waker()
-                } else {
-                    None
-                }
-            };
-
-            if let Some(waker) = waker {
-                waker.wake();
-            }
-        }
-    }
+struct ScopeGuard {
+    group: &'static LockGroup,
+    task_key: DefaultKey,
 }
 
-impl ScopeGuard {
-    #[inline]
-    fn check_cancelled(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Result<(), Cancelled> {
-        if let Some(init) = self.as_mut().project().cancel_node.initialized() {
-            // check the shutdown flag
-            if init
-                .unprotected()
-                .load(core::sync::atomic::Ordering::Acquire)
-            {
-                return Err(Cancelled(()));
+impl Drop for ScopeGuard {
+    fn drop(&mut self) {
+        let waker = {
+            let mut lock = self.group.lock.lock().unwrap();
+            lock.cancel_list.remove(self.task_key);
+
+            lock.tasks -= SHARED;
+            if lock.tasks & SHARED_MASK == 0 {
+                if lock.tasks & PARKED == PARKED {
+                    self.group.condvar.notify_one();
+                }
+                lock.take_waker()
+            } else {
+                None
             }
+        };
 
-            // Problem:
-            // If the waker changes between polls, this behaves poorly.
-            // however, I don't know any popular executors that don't
-            // use the same waker per top-level task poll. Note, this does not make this crate unsound,
-            // it just delays the cancellation of the task, potentially indefinitely. oh well.
-            // TODO: maybe look into diatomic_waker
-            // `init.protected_mut(&mut self.project().lock.lock().unwrap().cancel_list).clone_from(cx.waker())`
-        } else {
-            self.init_cancellation_node(cx)?;
+        if let Some(waker) = waker {
+            waker.wake();
         }
-        Ok(())
-    }
-
-    #[cold]
-    fn init_cancellation_node(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Result<(), Cancelled> {
-        let this = self.project();
-        debug_assert!(this.cancel_node.is_initial());
-
-        let mut lock = this.group.lock.lock().unwrap();
-
-        if lock.tasks & CLOSED == CLOSED {
-            return Err(Cancelled(()));
-        }
-
-        lock.cancel_list
-            .push_back(this.cancel_node, cx.waker().clone(), AtomicBool::new(false));
-
-        Ok(())
     }
 }
 
@@ -385,7 +335,6 @@ impl<F: Future, S> Future for ScopedFuture<F, S> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
-        this.inner.check_cancelled(cx)?;
 
         // SAFETY: future is always init and we do not move anything
         let future = unsafe { this.future.map_unchecked_mut(|f| &mut **f) };
@@ -396,8 +345,8 @@ impl<F: Future, S> Future for ScopedFuture<F, S> {
 #[derive(Debug)]
 pub struct Cancelled(());
 
-impl core::fmt::Display for Cancelled {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("the task was cancelled")
     }
 }
@@ -427,8 +376,7 @@ where
 
 #[cfg(all(test, not(loom)))]
 mod tests {
-    use core::{future::Future, pin::pin, task::Context, time::Duration};
-    use std::sync::Mutex;
+    use std::{future::Future, pin::pin, sync::Mutex, task::Context, time::Duration};
 
     use futures_util::task::noop_waker_ref;
     use tokio::task::yield_now;

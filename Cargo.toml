@@ -14,8 +14,8 @@ license = "MIT OR APACHE2"
 default = []
 
 [dependencies]
-pin-list = "0.1.0"
 pin-project-lite = "0.2"
+slotmap = "1.0.7"
 
 tokio = { version = "1.40.0", default-features = false, features = ["rt", "rt-multi-thread"] }
 tokio-util = { version = "0.7.12", features = ["rt"] }
