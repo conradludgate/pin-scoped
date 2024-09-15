@@ -1,15 +1,15 @@
 #![feature(async_closure)]
-#![cfg(all(not(loom), feature = "tokio"))]
+#![cfg(not(pin_scoped_loom))]
 
 use std::{pin::pin, sync::Mutex, task::Context};
 
 use futures_util::{task::noop_waker_ref, Future};
 use tokio::task::yield_now;
 
-use pin_scoped::{tokio::Global as TokioGlobal, Scope};
+use pin_scoped::Scope;
 
 async fn run(n: u64) -> u64 {
-    let mut scoped = pin!(Scope::<_, TokioGlobal>::new(Mutex::new(0)));
+    let mut scoped = pin!(Scope::new(Mutex::new(0)));
 
     for i in 0..n {
         scoped.as_mut().spawn(async move |state: &Mutex<u64>| {
