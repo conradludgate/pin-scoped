@@ -23,6 +23,7 @@ tokio-util = { version = "0.7.12", features = ["rt"] }
 futures-util = "0.3.30"
 tokio = { version = "1.40.0", default-features = false, features = ["sync", "macros", "time", "signal"] }
 trybuild = "1.0.99"
+diatomic-waker = "0.2"
 
 hyper = { version = "1.3.1", features = ["http1", "server"] }
 hyper-util = { version = "0.1.5", features = ["tokio"] }

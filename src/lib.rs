@@ -24,16 +24,14 @@ use slotmap::{DefaultKey, SlotMap};
 use sync::{Aliasable, Condvar, GuardPtr, ManuallyDropCell, Mutex};
 
 // The waker is set
-const WAKER: usize = 0b00001;
+const WAKER: usize = 0b0001;
 // The scope owner has parked the thread
-const PARKED: usize = 0b00010;
+const PARKED: usize = 0b0010;
 // The scope is closed and all tasks should stop
-const CLOSED: usize = 0b00100;
-// The scope state has been removed
-const REMOVED: usize = 0b01000;
+const CLOSED: usize = 0b0100;
 
 // value of 1 task sharing the state
-const SHARED: usize = 0b10000;
+const SHARED: usize = 0b1000;
 const SHARED_MASK: usize = !SHARED + 1;
 
 // /// The state is exclusively acquired from the scope
@@ -41,7 +39,7 @@ const SHARED_MASK: usize = !SHARED + 1;
 
 struct SharedState<State> {
     group: LockGroup,
-    /// initialised if and only if group.lock.tasks != [`REMOVED`]
+    /// initialised if and only if !scope.removed
     state: ManuallyDropCell<State>,
 }
 
@@ -116,6 +114,7 @@ pin_project! {
         aliased: Aliasable<SharedState<State>>,
 
         started_locking: bool,
+        removed: bool,
 
         runtime: Handle,
     }
@@ -127,13 +126,12 @@ pin_project! {
             let aliased = this.aliased.as_ref().get();
             *this.started_locking = true;
 
-            // lock and drop the state.
-            let mut lock = aliased.group.lock.lock().unwrap();
-
-            // might have already been removed by poll()
-            if lock.tasks & REMOVED == REMOVED {
+            if *this.removed {
                 return;
             }
+
+            // lock and drop the state.
+            let mut lock = aliased.group.lock.lock().unwrap();
 
             lock.tasks |= CLOSED; // mark as closed.
 
@@ -168,8 +166,7 @@ pin_project! {
             lock.drop_waker();
 
             debug_assert!(lock.cancel_list.is_empty());
-            debug_assert!(lock.tasks & REMOVED == 0, "state should not be dropped");
-            lock.tasks |= REMOVED;
+            *this.removed = true;
 
             // SAFETY:
             // 0 tasks means we have exclusive access to state now.
@@ -186,6 +183,8 @@ impl<State> Future for Scope<State> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<State> {
         let this = self.project();
+        assert!(!*this.removed, "polled after completion");
+
         *this.started_locking = true;
 
         let state = {
@@ -203,8 +202,7 @@ impl<State> Future for Scope<State> {
             lock.drop_waker();
 
             debug_assert!(lock.cancel_list.is_empty());
-            debug_assert!(lock.tasks & REMOVED == 0, "state should not be dropped");
-            lock.tasks |= REMOVED;
+            *this.removed = true;
 
             // SAFETY:
             // 0 tasks means we have exclusive access to state now.
@@ -241,6 +239,7 @@ impl<State: 'static + Sync> Scope<State> {
                 state: ManuallyDropCell::new(state),
             }),
             started_locking: false,
+            removed: false,
             runtime: rt,
         }
     }
@@ -321,6 +320,40 @@ impl<State: 'static + Sync> Scope<State> {
         }
 
         handle
+    }
+}
+
+impl<State: 'static> Scope<State> {
+    pub fn num_tasks(self: Pin<&Self>) -> usize {
+        let group = &self.project_ref().aliased.get().group.lock;
+        group.lock().unwrap().cancel_list.len()
+    }
+
+    pub fn get(self: Pin<&Self>) -> &State {
+        assert!(!self.removed);
+        unsafe { self.project_ref().aliased.get().state.borrow().0 }
+    }
+
+    pub fn poll_until_empty(self: Pin<&Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.project_ref();
+        if *this.removed {
+            return Poll::Ready(());
+        };
+
+        // acquire access to the shared state
+        let aliased = this.aliased.as_ref().get();
+        let mut lock = aliased.group.lock.lock().unwrap();
+
+        // if there are currently tasks running
+        // return pending and register the waker.
+        if lock.tasks & SHARED_MASK != 0 {
+            lock.register_waker(cx.waker());
+            return Poll::Pending;
+        }
+
+        debug_assert!(lock.cancel_list.is_empty());
+
+        Poll::Ready(())
     }
 }
 
