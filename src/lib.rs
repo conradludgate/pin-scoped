@@ -7,6 +7,7 @@ use std::mem::MaybeUninit;
 use std::task::{Context, Poll};
 use std::{mem::ManuallyDrop, pin::Pin, task::Waker};
 
+pub mod spawner;
 mod sync;
 
 #[cfg(pin_scoped_loom)]
@@ -33,9 +34,6 @@ const CLOSED: usize = 0b0100;
 // value of 1 task sharing the state
 const SHARED: usize = 0b1000;
 const SHARED_MASK: usize = !SHARED + 1;
-
-// /// The state is exclusively acquired from the scope
-// const EXCLUSIVE: usize = -1;
 
 struct SharedState<State> {
     group: LockGroup,

@@ -1,40 +1,20 @@
 #![feature(async_closure)]
 #![cfg(not(pin_scoped_loom))]
 
-use std::{future::poll_fn, pin::pin, sync::Mutex, task::Context};
+use std::{pin::pin, sync::Mutex, task::Context};
 
-use diatomic_waker::DiatomicWaker;
 use futures_util::{task::noop_waker_ref, Future};
-use tokio::{sync::Semaphore, task::yield_now};
 
-use pin_scoped::Scope;
+use pin_scoped::{spawner::StateWithSpawner, Scope};
 
 enum Task {
     ExtraSlow(u64),
 }
 
-struct State {
-    count: Mutex<u64>,
-    spawn_queue: Semaphore,
-    next_task: Mutex<Option<Task>>,
-    waker: DiatomicWaker,
-}
-
-impl State {
-    async fn spawn(&self, t: Task) {
-        self.spawn_queue.acquire().await.unwrap().forget();
-        *self.next_task.lock().unwrap() = Some(t);
-        self.waker.notify();
-    }
-}
+type State = StateWithSpawner<Mutex<u64>, Task>;
 
 async fn run(n: u64) -> u64 {
-    let mut scoped = pin!(Scope::new(State {
-        count: Mutex::new(0),
-        spawn_queue: Semaphore::const_new(1),
-        next_task: Mutex::new(None),
-        waker: DiatomicWaker::new(),
-    }));
+    let mut scoped = pin!(Scope::new(StateWithSpawner::new(Mutex::new(0))));
 
     for i in 0..n {
         scoped.as_mut().spawn(async move |state: &State| {
@@ -42,51 +22,48 @@ async fn run(n: u64) -> u64 {
             state.spawn(Task::ExtraSlow(i)).await;
 
             tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
-            *state.count.lock().unwrap() += 1;
+            *state.state.lock().unwrap() += 1;
             tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
         });
     }
 
-    loop {
-        let state = scoped.as_ref().get();
-        let get_task = || state.next_task.lock().unwrap().take();
-
-        // SAFETY: only called by the scope owner task. Not concurrently
-        let task = unsafe { state.waker.wait_until(get_task) };
-        let empty = poll_fn(|cx| scoped.as_ref().poll_until_empty(cx));
-
-        tokio::select! {
-            _ = empty => break,
-            task = task => {
-                state.spawn_queue.add_permits(1);
-
-                match task {
-                    Task::ExtraSlow(i) => {
-                        scoped.as_mut().spawn(async move |state: &State| {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(20 * i)).await;
-                            *state.count.lock().unwrap() += 1;
-                            tokio::time::sleep(tokio::time::Duration::from_millis(20 * i)).await;
-                        });
-                    }
-                }
+    while let Some(task) = scoped.as_mut().pop_task().await {
+        match task {
+            Task::ExtraSlow(i) => {
+                scoped.as_mut().spawn(async move |state: &State| {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(20 * i)).await;
+                    *state.state.lock().unwrap() += 1;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(20 * i)).await;
+                });
             }
         }
     }
 
-    scoped.await.count.into_inner().unwrap()
+    scoped.await.state.into_inner().unwrap()
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn scoped() {
-    assert_eq!(run(32).await, 64);
+fn rt() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_time()
+        .worker_threads(1)
+        .build()
+        .unwrap()
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn dropped() {
+#[test]
+fn scoped() {
+    let res = rt().block_on(run(32));
+    assert_eq!(res, 64);
+}
+
+#[test]
+fn dropped() {
+    let rt = rt();
+    let _guard = rt.enter();
+
     let mut task = pin!(run(32));
     assert!(task
         .as_mut()
         .poll(&mut Context::from_waker(noop_waker_ref()))
         .is_pending());
-    yield_now().await;
 }
