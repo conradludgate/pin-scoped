@@ -1,12 +1,14 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![warn(clippy::significant_drop_tightening)]
 
+use async_fn::AsyncFnOnceRef;
 use pin_project_lite::pin_project;
 use std::future::Future;
 use std::mem::MaybeUninit;
 use std::task::{Context, Poll};
 use std::{mem::ManuallyDrop, pin::Pin, task::Waker};
 
+pub mod async_fn;
 pub mod spawner;
 mod sync;
 
@@ -351,6 +353,8 @@ impl<State: 'static> Scope<State> {
 
         debug_assert!(lock.cancel_list.is_empty());
 
+        drop(lock);
+
         Poll::Ready(())
     }
 }
@@ -412,27 +416,6 @@ impl<F: Future, S> Future for ScopedFuture<F, S> {
         // SAFETY: future is always init and we do not move anything
         let future = unsafe { this.future.map_unchecked_mut(|f| &mut **f) };
         future.poll(cx)
-    }
-}
-
-pub trait AsyncFnOnceRef<S, R> {
-    fn call(self, state: &S) -> impl Send + Future<Output = R>;
-}
-
-trait MyFnOnce<Arg>: FnOnce(Arg) -> Self::Ret {
-    type Ret;
-}
-impl<F: FnOnce(A) -> R, A, R> MyFnOnce<A> for F {
-    type Ret = R;
-}
-
-impl<S: 'static, F, R: Send + 'static> AsyncFnOnceRef<S, R> for F
-where
-    F: 'static + for<'state> MyFnOnce<&'state S>,
-    for<'state> <F as MyFnOnce<&'state S>>::Ret: Send + Future<Output = R>,
-{
-    fn call(self, state: &S) -> impl Send + Future<Output = R> {
-        (self)(state)
     }
 }
 

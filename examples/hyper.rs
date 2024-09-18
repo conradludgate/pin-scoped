@@ -13,7 +13,7 @@ use hyper::{
     Request, Response,
 };
 use hyper_util::rt::TokioIo;
-use pin_scoped::{AsyncFnOnceRef, Scope};
+use pin_scoped::{async_fn::AsyncFnOnceRef, Scope};
 use tokio::{
     net::{TcpListener, TcpStream},
     signal::ctrl_c,

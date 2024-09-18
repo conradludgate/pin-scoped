@@ -1,4 +1,9 @@
-use std::{future::poll_fn, pin::Pin, sync::Mutex};
+use std::{
+    future::{poll_fn, Future},
+    pin::{pin, Pin},
+    sync::Mutex,
+    task::Poll,
+};
 
 use diatomic_waker::DiatomicWaker;
 use tokio::sync::Semaphore;
@@ -27,11 +32,17 @@ impl<State: 'static, Task> Scope<StateWithSpawner<State, Task>> {
     pub async fn pop_task(self: Pin<&mut Self>) -> Option<Task> {
         let state = self.as_ref().get();
 
-        tokio::select! {
-            _ = poll_fn(|cx| self.as_ref().poll_until_empty(cx)) => None,
-            // SAFETY: we have &mut access to the scope. Cannot be running concurrently
-            task = unsafe { state.spawner.pop() } => Some(task),
-        }
+        // SAFETY: we have &mut access to the scope. Cannot be running concurrently
+        let mut pop = pin!(unsafe { state.spawner.pop() });
+
+        poll_fn(|cx| {
+            if self.as_ref().poll_until_empty(cx).is_ready() {
+                Poll::Ready(None)
+            } else {
+                pop.as_mut().poll(cx).map(Some)
+            }
+        })
+        .await
     }
 }
 

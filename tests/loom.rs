@@ -47,7 +47,7 @@ fn dropped() {
 async fn run(n: u32, rt: Handle) -> u64 {
     let scoped = pin!(Scope::with_runtime(Mutex::new(0), rt));
     struct Ex;
-    impl pin_scoped::AsyncFnOnceRef<Mutex<u64>, ()> for Ex {
+    impl pin_scoped::async_fn::AsyncFnOnceRef<Mutex<u64>, ()> for Ex {
         async fn call(self, state: &Mutex<u64>) {
             yield_now().await;
             *state.lock().unwrap() += 1;
