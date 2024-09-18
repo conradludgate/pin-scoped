@@ -45,7 +45,7 @@ fn dropped() {
 }
 
 async fn run(n: u32, rt: Handle) -> u64 {
-    let mut scoped = pin!(Scope::with_runtime(Mutex::new(0), rt));
+    let scoped = pin!(Scope::with_runtime(Mutex::new(0), rt));
     struct Ex;
     impl pin_scoped::AsyncFnOnceRef<Mutex<u64>, ()> for Ex {
         async fn call(self, state: &Mutex<u64>) {
@@ -56,7 +56,7 @@ async fn run(n: u32, rt: Handle) -> u64 {
     }
 
     for _ in 0..n {
-        scoped.as_mut().spawn(Ex);
+        scoped.as_ref().spawn(Ex);
     }
 
     scoped.await.into_inner().unwrap()

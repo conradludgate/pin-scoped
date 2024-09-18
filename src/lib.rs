@@ -264,12 +264,12 @@ impl<State: 'static + Sync> Scope<State> {
     ///
     /// * Panics if called from **outside** of the Tokio runtime.
     /// * Panics if called after **awaiting** `Scope`
-    pub fn spawn<F, R>(self: Pin<&mut Self>, f: F) -> JoinHandle<R>
+    pub fn spawn<F, R>(self: Pin<&Self>, f: F) -> JoinHandle<R>
     where
         F: AsyncFnOnceRef<State, R> + 'static,
         R: Send + 'static,
     {
-        let this = self.project();
+        let this = self.project_ref();
 
         assert!(
             !*this.started_locking,
@@ -455,10 +455,10 @@ mod tests {
     }
 
     async fn run(n: u32) -> u64 {
-        let mut scoped = pin!(Scope::new(Mutex::new(0)));
+        let scoped = pin!(Scope::new(Mutex::new(0)));
 
         for i in 0..n {
-            scoped.as_mut().spawn(Ex(i));
+            scoped.as_ref().spawn(Ex(i));
         }
 
         scoped.await.into_inner().unwrap()

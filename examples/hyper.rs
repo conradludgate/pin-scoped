@@ -74,7 +74,7 @@ async fn scoped_loop(
     server: Http1Builder,
     listener: TcpListener,
 ) -> Result<State, Box<dyn std::error::Error + 'static>> {
-    let mut scope = pin!(Scope::new(state));
+    let scope = pin!(Scope::new(state));
     let mut close = pin!(ctrl_c());
 
     loop {
@@ -82,7 +82,7 @@ async fn scoped_loop(
             _ = close.as_mut() => { break },
             res = listener.accept() => {
                 let (io, _) = res?;
-                scope.as_mut().spawn(ServerConnection(server.clone(), io));
+                scope.as_ref().spawn(ServerConnection(server.clone(), io));
             }
         }
     }

@@ -7,12 +7,12 @@ use pin_scoped::Scope;
 
 #[tokio::main]
 async fn main()  {
-    let mut scoped = pin!(Scope::new(Mutex::new(0)));
+    let scoped = pin!(Scope::new(Mutex::new(0)));
 
     let non_scoped = Mutex::new(0);
 
     for _ in 0..64 {
-        scoped.as_mut().spawn(async |state: &Mutex<u64>| {
+        scoped.as_ref().spawn(async |state: &Mutex<u64>| {
             yield_now().await;
             *state.lock().unwrap() += 1;
             *non_scoped.lock().unwrap() += 1;

@@ -1,7 +1,7 @@
 error[E0597]: `non_scoped` does not live long enough
   --> tests/ui/01-capture-state.rs:15:31
    |
-15 |            scoped.as_mut().spawn(async |state: &Mutex<u64>| {
+15 |            scoped.as_ref().spawn(async |state: &Mutex<u64>| {
    |   _________-                     ^
    |  |_______________________________|
 16 | ||             yield_now().await;
