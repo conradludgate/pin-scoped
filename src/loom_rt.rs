@@ -60,6 +60,8 @@ impl<R> JoinHandle<R> {
     pub fn abort_handle(&self) -> AbortHandle {
         self.1.clone()
     }
+
+    pub fn abort(&self) {}
 }
 
 #[derive(Clone)]

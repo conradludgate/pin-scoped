@@ -11,7 +11,6 @@ use std::task::{Context, Poll};
 use std::{mem::ManuallyDrop, pin::Pin, task::Waker};
 
 pub mod async_fn;
-pub mod spawner;
 mod sync;
 
 #[cfg(pin_scoped_loom)]
@@ -56,22 +55,24 @@ impl<State: 'static + Sync> SharedState<State> {
         F: AsyncFnOnceRef<ScopeState<State>, R> + 'static,
         R: Send + 'static,
     {
-        // let this = self.project_ref();
-
-        // assert!(
-        //     !*this.started_locking,
-        //     "spawn should not be called after awaiting the Scope handle"
-        // );
-
-        // let state = this.aliased.as_ref();
-
         // acquire the shared access lock
         let task_key = {
             let mut lock = self.group.lock.lock().unwrap();
+
+            debug_assert_eq!(lock.tasks >> 3, lock.cancel_list.len());
+
+            if lock.tasks & CLOSED == CLOSED {
+                drop(lock);
+                // todo: return an error
+                panic!("scope is in a closing state.");
+            }
+
             let Some(tasks) = lock.tasks.checked_add(SHARED) else {
+                drop(lock);
                 // takes some very strange system to achieve this.
                 panic!("number of active exceeded maximum")
             };
+
             lock.tasks = tasks;
             lock.cancel_list.insert(None)
         };
@@ -104,9 +105,18 @@ impl<State: 'static + Sync> SharedState<State> {
         // fill in abort handle
         {
             let mut lock = self.group.lock.lock().unwrap();
+            debug_assert_eq!(lock.tasks >> 3, lock.cancel_list.len());
+            let tasks = lock.tasks;
+
             if let Some(handle_slot) = lock.cancel_list.get_mut(task_key) {
-                *handle_slot = Some(handle.abort_handle());
+                if tasks & CLOSED == CLOSED {
+                    // if we are now closed, pre-emptively abort the new task.
+                    handle.abort();
+                } else {
+                    *handle_slot = Some(handle.abort_handle());
+                }
             }
+
             drop(lock);
         }
 
@@ -116,6 +126,37 @@ impl<State: 'static + Sync> SharedState<State> {
 
 #[repr(transparent)]
 pub struct ScopeState<State>(SharedState<State>);
+
+impl<State: 'static + Sync> ScopeState<State> {
+    /// Spawns a new asynchronous task, returning a [`JoinHandle`] for it.
+    ///
+    /// The provided future will start running in the background immediately
+    /// when `spawn` is called, even if you don't await the returned
+    /// `JoinHandle`.
+    ///
+    /// Spawning a task enables the task to execute concurrently to other tasks. The
+    /// spawned task may execute on the current thread, or it may be sent to a
+    /// different thread to be executed.
+    ///
+    /// It is guaranteed that spawn will not synchronously poll the task being spawned.
+    /// This means that calling spawn while holding a lock does not pose a risk of
+    /// deadlocking with the spawned task.
+    ///
+    /// There is no guarantee that a spawned task will execute to completion.
+    /// When a runtime is shutdown, all outstanding tasks are dropped,
+    /// regardless of the lifecycle of that task.
+    ///
+    /// # Panics
+    ///
+    /// * Panics if called after **awaiting** or **dropping** the parent `Scope`
+    pub fn spawn<F, R>(this: Pin<&Self>, f: F) -> JoinHandle<R>
+    where
+        F: AsyncFnOnceRef<ScopeState<State>, R> + 'static,
+        R: Send + 'static,
+    {
+        unsafe { this.map_unchecked(|p| &p.0) }.spawn(f)
+    }
+}
 
 impl<State> Deref for ScopeState<State> {
     type Target = State;
@@ -284,6 +325,8 @@ impl<State> Future for Scope<State> {
                 return Poll::Pending;
             }
 
+            lock.tasks |= CLOSED; // mark as closed.
+
             lock.drop_waker();
 
             debug_assert!(lock.cancel_list.is_empty());
@@ -304,6 +347,9 @@ impl<State> Future for Scope<State> {
 }
 
 impl<State: 'static + Sync> Scope<State> {
+    /// # Panics
+    ///
+    /// * Panics if called from **outside** of the Tokio runtime.
     pub fn new(state: State) -> Self {
         Self::with_runtime(state, Handle::current())
     }
@@ -350,7 +396,6 @@ impl<State: 'static + Sync> Scope<State> {
     ///
     /// # Panics
     ///
-    /// * Panics if called from **outside** of the Tokio runtime.
     /// * Panics if called after **awaiting** `Scope`
     pub fn spawn<F, R>(self: Pin<&Self>, f: F) -> JoinHandle<R>
     where
