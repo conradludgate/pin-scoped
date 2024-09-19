@@ -43,11 +43,76 @@ struct SharedState<State> {
     group: LockGroup,
     /// initialised if and only if !scope.removed
     state: ManuallyDropCell<State>,
-    /// mark as !Unpin since we share the state ref
-    _pinned: PhantomPinned,
+
+    /// runtime to spawn tasks into
+    runtime: Handle,
 }
 
 unsafe impl<T: Sync> Sync for SharedState<T> {}
+
+impl<State: 'static + Sync> SharedState<State> {
+    fn spawn<F, R>(self: Pin<&Self>, f: F) -> JoinHandle<R>
+    where
+        F: AsyncFnOnceRef<ScopeState<State>, R> + 'static,
+        R: Send + 'static,
+    {
+        // let this = self.project_ref();
+
+        // assert!(
+        //     !*this.started_locking,
+        //     "spawn should not be called after awaiting the Scope handle"
+        // );
+
+        // let state = this.aliased.as_ref();
+
+        // acquire the shared access lock
+        let task_key = {
+            let mut lock = self.group.lock.lock().unwrap();
+            let Some(tasks) = lock.tasks.checked_add(SHARED) else {
+                // takes some very strange system to achieve this.
+                panic!("number of active exceeded maximum")
+            };
+            lock.tasks = tasks;
+            lock.cancel_list.insert(None)
+        };
+
+        // SAFETY:
+        // state will stay valid for shared access until the returned future gets dropped.
+        let (_, ptr_guard) = unsafe { self.state.borrow() };
+
+        // SAFETY:
+        // 1. `shared_state` cannot outlive the returned futures.
+        // 2. futures cannot outlive `Scope` as scope will block the current runtime thread on drop.
+        // 3. ScopeState is transparent to SharedState
+        let shared_state =
+            unsafe { &*(&*self as *const SharedState<State> as *const ScopeState<State>) };
+
+        let future = f.call(unsafe { Pin::new_unchecked(shared_state) });
+
+        let inner = ScopeGuard {
+            // SAFETY: shared_state is already pinned
+            group: unsafe { Pin::new_unchecked(&shared_state.0.group) },
+            task_key,
+        };
+
+        let handle = self.runtime.spawn(ScopedFuture {
+            inner,
+            future: ManuallyDrop::new(future),
+            ptr_guard,
+        });
+
+        // fill in abort handle
+        {
+            let mut lock = self.group.lock.lock().unwrap();
+            if let Some(handle_slot) = lock.cancel_list.get_mut(task_key) {
+                *handle_slot = Some(handle.abort_handle());
+            }
+            drop(lock);
+        }
+
+        handle
+    }
+}
 
 #[repr(transparent)]
 pub struct ScopeState<State>(SharedState<State>);
@@ -64,6 +129,9 @@ impl<State> Deref for ScopeState<State> {
 struct LockGroup {
     lock: Mutex<LockState>,
     condvar: Condvar,
+
+    /// mark as !Unpin since we share the state ref
+    _pinned: PhantomPinned,
 }
 
 struct LockState {
@@ -134,7 +202,6 @@ pin_project! {
         started_locking: bool,
         removed: bool,
 
-        runtime: Handle,
     }
 
     impl<State: 'static> PinnedDrop for Scope<State> {
@@ -253,13 +320,13 @@ impl<State: 'static + Sync> Scope<State> {
                         cancel_list: SlotMap::new(),
                     }),
                     condvar: Condvar::new(),
+                    _pinned: PhantomPinned,
                 },
                 state: ManuallyDropCell::new(state),
-                _pinned: PhantomPinned,
+                runtime: rt,
             },
             started_locking: false,
             removed: false,
-            runtime: rt,
         }
     }
 
@@ -299,51 +366,7 @@ impl<State: 'static + Sync> Scope<State> {
 
         let state = this.aliased.as_ref();
 
-        // acquire the shared access lock
-        let task_key = {
-            let mut lock = state.group.lock.lock().unwrap();
-            let Some(tasks) = lock.tasks.checked_add(SHARED) else {
-                // takes some very strange system to achieve this.
-                panic!("number of active exceeded maximum")
-            };
-            lock.tasks = tasks;
-            lock.cancel_list.insert(None)
-        };
-
-        // SAFETY:
-        // state will stay valid for shared access until the returned future gets dropped.
-        let (_, ptr_guard) = unsafe { state.state.borrow() };
-
-        // SAFETY:
-        // 1. `shared_state` cannot outlive the returned futures.
-        // 2. futures cannot outlive `Scope` as scope will block the current runtime thread on drop.
-        // 3. ScopeState is transparent to SharedState
-        let shared_state =
-            unsafe { &*(&*state as *const SharedState<State> as *const ScopeState<State>) };
-        // SAFETY: shared_state is already pinned
-        let future = f.call(unsafe { Pin::new_unchecked(shared_state) });
-
-        let inner = ScopeGuard {
-            group: &shared_state.0.group,
-            task_key,
-        };
-
-        let handle = this.runtime.spawn(ScopedFuture {
-            inner,
-            future: ManuallyDrop::new(future),
-            ptr_guard,
-        });
-
-        // fill in abort handle
-        {
-            let mut lock = state.group.lock.lock().unwrap();
-            if let Some(handle_slot) = lock.cancel_list.get_mut(task_key) {
-                *handle_slot = Some(handle.abort_handle());
-            }
-            drop(lock);
-        }
-
-        handle
+        state.spawn(f)
     }
 }
 
@@ -384,7 +407,7 @@ impl<State: 'static> Scope<State> {
 }
 
 struct ScopeGuard {
-    group: &'static LockGroup,
+    group: Pin<&'static LockGroup>,
     task_key: DefaultKey,
 }
 
