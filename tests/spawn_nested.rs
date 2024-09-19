@@ -1,23 +1,27 @@
 #![feature(async_closure)]
 #![cfg(not(pin_scoped_loom))]
 
-use std::{pin::pin, sync::Mutex, task::Context};
+use std::{
+    pin::{pin, Pin},
+    sync::Mutex,
+    task::Context,
+};
 
 use futures_util::{task::noop_waker_ref, Future};
 
-use pin_scoped::{spawner::StateWithSpawner, Scope};
+use pin_scoped::{spawner::StateWithSpawner, Scope, ScopeState};
 
 enum Task {
     ExtraSlow(u64),
 }
 
-type State = StateWithSpawner<Mutex<u64>, Task>;
+type State = ScopeState<StateWithSpawner<Mutex<u64>, Task>>;
 
 async fn run(n: u64) -> u64 {
     let mut scoped = pin!(Scope::new(StateWithSpawner::new(Mutex::new(0))));
 
     for i in 0..n {
-        scoped.as_ref().spawn(async move |state: &State| {
+        scoped.as_ref().spawn(async move |state: Pin<&State>| {
             // we can spawn internally through some channel abstraction
             state.spawn(Task::ExtraSlow(i)).await;
 
@@ -30,7 +34,7 @@ async fn run(n: u64) -> u64 {
     while let Some(task) = scoped.as_mut().pop_task().await {
         match task {
             Task::ExtraSlow(i) => {
-                scoped.as_ref().spawn(async move |state: &State| {
+                scoped.as_ref().spawn(async move |state: Pin<&State>| {
                     tokio::time::sleep(tokio::time::Duration::from_millis(20 * i)).await;
                     *state.state.lock().unwrap() += 1;
                     tokio::time::sleep(tokio::time::Duration::from_millis(20 * i)).await;

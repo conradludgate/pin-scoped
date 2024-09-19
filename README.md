@@ -11,7 +11,7 @@ let mut scope = pin!(TokioScope::new(Mutex::new(0)));
 
 // spawn n tasks, with a shared reference to the pinned-state only.
 for i in 0..n {
-    scope.as_mut().spawn(async move |state: &Mutex<u64>| {
+    scope.as_mut().spawn(async move |state: Pin<&ScopeState<Mutex<u64>>>| {
         tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
         *state.lock().unwrap() += 1;
         tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;

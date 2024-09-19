@@ -4,7 +4,9 @@
 use async_fn::AsyncFnOnceRef;
 use pin_project_lite::pin_project;
 use std::future::Future;
+use std::marker::PhantomPinned;
 use std::mem::MaybeUninit;
+use std::ops::Deref;
 use std::task::{Context, Poll};
 use std::{mem::ManuallyDrop, pin::Pin, task::Waker};
 
@@ -24,7 +26,7 @@ use tokio::{
 };
 
 use slotmap::{DefaultKey, SlotMap};
-use sync::{Aliasable, Condvar, GuardPtr, ManuallyDropCell, Mutex};
+use sync::{Condvar, GuardPtr, ManuallyDropCell, Mutex};
 
 // The waker is set
 const WAKER: usize = 0b0001;
@@ -41,6 +43,22 @@ struct SharedState<State> {
     group: LockGroup,
     /// initialised if and only if !scope.removed
     state: ManuallyDropCell<State>,
+    /// mark as !Unpin since we share the state ref
+    _pinned: PhantomPinned,
+}
+
+unsafe impl<T: Sync> Sync for SharedState<T> {}
+
+#[repr(transparent)]
+pub struct ScopeState<State>(SharedState<State>);
+
+impl<State> Deref for ScopeState<State> {
+    type Target = State;
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: while we have the scopestate, it is guaranteed that the state is init.
+        unsafe { self.0.state.borrow().0 }
+    }
 }
 
 struct LockGroup {
@@ -111,7 +129,7 @@ pin_project! {
     /// thread will block until all tasks have dropped.
     pub struct Scope<State: 'static> {
         #[pin]
-        aliased: Aliasable<SharedState<State>>,
+        aliased: SharedState<State>,
 
         started_locking: bool,
         removed: bool,
@@ -123,7 +141,7 @@ pin_project! {
         #[inline(never)]
         fn drop(this: Pin<&mut Self>) {
             let this = this.project();
-            let aliased = this.aliased.as_ref().get();
+            let aliased = this.aliased.as_ref();
             *this.started_locking = true;
 
             if *this.removed {
@@ -189,7 +207,7 @@ impl<State> Future for Scope<State> {
 
         let state = {
             // acquire access to the shared state
-            let aliased = this.aliased.as_ref().get();
+            let aliased = this.aliased.as_ref();
             let mut lock = aliased.group.lock.lock().unwrap();
 
             // if there are currently tasks running
@@ -227,7 +245,7 @@ impl<State: 'static + Sync> Scope<State> {
 impl<State: 'static + Sync> Scope<State> {
     pub fn with_runtime(state: State, rt: Handle) -> Self {
         Self {
-            aliased: Aliasable::new(SharedState {
+            aliased: SharedState {
                 group: LockGroup {
                     lock: Mutex::new(LockState {
                         waker: MaybeUninit::uninit(),
@@ -237,7 +255,8 @@ impl<State: 'static + Sync> Scope<State> {
                     condvar: Condvar::new(),
                 },
                 state: ManuallyDropCell::new(state),
-            }),
+                _pinned: PhantomPinned,
+            },
             started_locking: false,
             removed: false,
             runtime: rt,
@@ -268,7 +287,7 @@ impl<State: 'static + Sync> Scope<State> {
     /// * Panics if called after **awaiting** `Scope`
     pub fn spawn<F, R>(self: Pin<&Self>, f: F) -> JoinHandle<R>
     where
-        F: AsyncFnOnceRef<State, R> + 'static,
+        F: AsyncFnOnceRef<ScopeState<State>, R> + 'static,
         R: Send + 'static,
     {
         let this = self.project_ref();
@@ -278,10 +297,7 @@ impl<State: 'static + Sync> Scope<State> {
             "spawn should not be called after awaiting the Scope handle"
         );
 
-        // SAFETY:
-        // 1. `state` cannot outlive the returned futures.
-        // 2. futures cannot outlive `Scope` as scope blocked the current runtime thread on drop.
-        let state = unsafe { this.aliased.as_ref().get_extended() };
+        let state = this.aliased.as_ref();
 
         // acquire the shared access lock
         let task_key = {
@@ -296,11 +312,19 @@ impl<State: 'static + Sync> Scope<State> {
 
         // SAFETY:
         // state will stay valid for shared access until the returned future gets dropped.
-        let (val, ptr_guard) = unsafe { state.state.borrow() };
-        let future = f.call(val);
+        let (_, ptr_guard) = unsafe { state.state.borrow() };
+
+        // SAFETY:
+        // 1. `shared_state` cannot outlive the returned futures.
+        // 2. futures cannot outlive `Scope` as scope will block the current runtime thread on drop.
+        // 3. ScopeState is transparent to SharedState
+        let shared_state =
+            unsafe { &*(&*state as *const SharedState<State> as *const ScopeState<State>) };
+        // SAFETY: shared_state is already pinned
+        let future = f.call(unsafe { Pin::new_unchecked(shared_state) });
 
         let inner = ScopeGuard {
-            group: &state.group,
+            group: &shared_state.0.group,
             task_key,
         };
 
@@ -325,13 +349,13 @@ impl<State: 'static + Sync> Scope<State> {
 
 impl<State: 'static> Scope<State> {
     pub fn num_tasks(self: Pin<&Self>) -> usize {
-        let group = &self.project_ref().aliased.get().group.lock;
+        let group = &self.aliased.group.lock;
         group.lock().unwrap().cancel_list.len()
     }
 
     pub fn get(self: Pin<&Self>) -> &State {
         assert!(!self.removed);
-        unsafe { self.project_ref().aliased.get().state.borrow().0 }
+        unsafe { self.aliased.state.borrow().0 }
     }
 
     pub fn poll_until_empty(self: Pin<&Self>, cx: &mut Context<'_>) -> Poll<()> {
@@ -341,7 +365,7 @@ impl<State: 'static> Scope<State> {
         };
 
         // acquire access to the shared state
-        let aliased = this.aliased.as_ref().get();
+        let aliased = this.aliased.as_ref();
         let mut lock = aliased.group.lock.lock().unwrap();
 
         // if there are currently tasks running
@@ -421,15 +445,21 @@ impl<F: Future, S> Future for ScopedFuture<F, S> {
 
 #[cfg(all(test, not(pin_scoped_loom)))]
 mod tests {
-    use std::{future::Future, pin::pin, sync::Mutex, task::Context, time::Duration};
+    use std::{
+        future::Future,
+        pin::{pin, Pin},
+        sync::Mutex,
+        task::Context,
+        time::Duration,
+    };
 
     use futures_util::task::noop_waker_ref;
 
-    use crate::Scope;
+    use crate::{Scope, ScopeState};
 
     struct Ex(u32);
-    impl super::AsyncFnOnceRef<Mutex<u64>, ()> for Ex {
-        async fn call(self, state: &Mutex<u64>) {
+    impl super::AsyncFnOnceRef<ScopeState<Mutex<u64>>, ()> for Ex {
+        async fn call(self, state: Pin<&ScopeState<Mutex<u64>>>) {
             let i = self.0;
             tokio::time::sleep(Duration::from_millis(10) * i).await;
             *state.lock().unwrap() += 1;

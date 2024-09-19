@@ -3,10 +3,10 @@
 use futures_util::task::noop_waker_ref;
 use loom::sync::Mutex;
 use pin_scoped::loom_rt::Handle;
-use pin_scoped::Scope;
+use pin_scoped::{Scope, ScopeState};
 use std::{
     future::{poll_fn, Future},
-    pin::pin,
+    pin::{pin, Pin},
     task::Context,
 };
 
@@ -47,8 +47,8 @@ fn dropped() {
 async fn run(n: u32, rt: Handle) -> u64 {
     let scoped = pin!(Scope::with_runtime(Mutex::new(0), rt));
     struct Ex;
-    impl pin_scoped::async_fn::AsyncFnOnceRef<Mutex<u64>, ()> for Ex {
-        async fn call(self, state: &Mutex<u64>) {
+    impl pin_scoped::async_fn::AsyncFnOnceRef<ScopeState<Mutex<u64>>, ()> for Ex {
+        async fn call(self, state: Pin<&ScopeState<Mutex<u64>>>) {
             yield_now().await;
             *state.lock().unwrap() += 1;
             yield_now().await;

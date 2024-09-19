@@ -1,7 +1,7 @@
 #![cfg(not(any(miri, pin_scoped_loom)))]
 
 use std::{
-    pin::pin,
+    pin::{pin, Pin},
     sync::{atomic::AtomicUsize, Arc},
 };
 
@@ -13,7 +13,7 @@ use hyper::{
     Request, Response,
 };
 use hyper_util::rt::TokioIo;
-use pin_scoped::{async_fn::AsyncFnOnceRef, Scope};
+use pin_scoped::{async_fn::AsyncFnOnceRef, Scope, ScopeState};
 use tokio::{
     net::{TcpListener, TcpStream},
     signal::ctrl_c,
@@ -58,7 +58,7 @@ async fn arced_loop(
                 let state = state.clone();
                 let server = server.clone();
                 tracker.spawn(async move {
-                    ServerConnection(server, io).call(&state).await
+                    ServerConnection(server, io).handle_conn(&state).await
                 });
             }
         }
@@ -91,8 +91,14 @@ async fn scoped_loop(
 }
 
 struct ServerConnection(Http1Builder, TcpStream);
-impl AsyncFnOnceRef<State, ()> for ServerConnection {
-    async fn call(self, state: &State) {
+impl AsyncFnOnceRef<ScopeState<State>, ()> for ServerConnection {
+    async fn call(self, state: Pin<&ScopeState<State>>) {
+        self.handle_conn(&state).await;
+    }
+}
+
+impl ServerConnection {
+    async fn handle_conn(self, state: &State) {
         let _: Result<(), _> = self
             .0
             .serve_connection(
