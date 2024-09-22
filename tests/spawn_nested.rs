@@ -1,11 +1,16 @@
 #![feature(async_closure)]
 #![cfg(not(pin_scoped_loom))]
 
-use std::{pin::pin, sync::Mutex, task::Context};
+use std::{
+    pin::pin,
+    sync::{atomic::AtomicU64, Mutex},
+    task::Context,
+};
 
 use futures_util::{task::noop_waker_ref, Future};
 
-use pin_scoped::{NestedStack, Scope, ScopeState};
+use pin_scoped::{Scope, Stack};
+use tokio::time::{sleep, Duration};
 
 async fn run(n: u64) -> u64 {
     let scoped = pin!(Scope::new(Mutex::new(0)));
@@ -13,23 +18,22 @@ async fn run(n: u64) -> u64 {
     for i in 0..n {
         scoped
             .as_ref()
-            .spawn(async move |state: ScopeState<Mutex<u64>>| {
-                let nested = pin!(state.nest(Mutex::new(0)));
+            .spawn(async move |state: Stack![Mutex<u64>]| {
+                let nested = pin!(state.nest(AtomicU64::new(0)));
 
                 // we can spawn new scopes internally
-                nested.as_ref().spawn(
-                    async move |state: ScopeState<NestedStack<Mutex<u64>, Mutex<u64>>>| {
+                nested
+                    .as_ref()
+                    .spawn(async move |state: Stack![AtomicU64, Mutex<u64>]| {
                         *state.parent_scope().lock().unwrap() += 1;
 
-                        tokio::time::sleep(tokio::time::Duration::from_millis(20 * i)).await;
-                        *state.lock().unwrap() += 1;
-                        tokio::time::sleep(tokio::time::Duration::from_millis(20 * i)).await;
-                    },
-                );
+                        sleep(Duration::from_millis(20 * i)).await;
+                        state.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    });
 
-                tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
-                *state.lock().unwrap() += nested.await.into_inner().unwrap();
-                tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
+                sleep(Duration::from_millis(10 * i)).await;
+
+                *state.lock().unwrap() += nested.await.into_inner();
             });
     }
 

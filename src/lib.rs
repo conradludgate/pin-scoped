@@ -27,6 +27,24 @@ use tokio::{
 use slotmap::{DefaultKey, SlotMap};
 use sync::{Condvar, GuardPtr, ManuallyDropCell, Mutex};
 
+#[macro_export]
+macro_rules! Stack {
+    [$($t:ty),* $(,)?] => {
+        $crate::ScopeState<'_, $crate::StackInner![$($t),*]>
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! StackInner {
+    [$t:ty $(, $rest:ty)+] => {
+        $crate::NestedStack<$crate::StackInner![$($rest),*], $t>
+    };
+    [$t:ty] => {
+        $t
+    };
+}
+
 // The waker is set
 const WAKER: usize = 0b0001;
 // The scope owner has parked the thread
