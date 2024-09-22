@@ -1,0 +1,12 @@
+error: lifetime may not live long enough
+  --> tests/ui/04-return-nested-state.rs:13:52
+   |
+13 |         .spawn(async move |state: ScopeState<u64>| state.nest(1));
+   |                            -----                 - ^^^^^^^^^^^^^ returning this value requires that `'1` must outlive `'2`
+   |                            |                     |
+   |                            |                     return type of async closure `{async closure body@$DIR/tests/ui/04-return-nested-state.rs:13:52: 13:65}` contains a lifetime `'2`
+   |                            has type `ScopeState<'1, u64>`
+   |
+   = note: requirement occurs because of the type `NestedScope<'_, u64, i32>`, which makes the generic argument `'_` invariant
+   = note: the struct `NestedScope<'parent, Head, State>` is invariant over the parameter `'parent`
+   = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance

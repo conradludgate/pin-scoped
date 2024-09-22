@@ -6,8 +6,8 @@ use pin_project_lite::pin_project;
 use std::future::Future;
 use std::marker::{PhantomData, PhantomPinned};
 use std::mem::MaybeUninit;
-use std::ops::Deref;
-use std::task::{Context, Poll};
+use std::ops::{Deref, DerefMut};
+use std::task::{ready, Context, Poll};
 use std::{mem::ManuallyDrop, pin::Pin, task::Waker};
 
 pub mod async_fn;
@@ -164,11 +164,15 @@ impl<State: 'static + Sync> ScopeState<'_, State> {
 }
 
 impl<'parent, State: 'static + Sync> ScopeState<'parent, State> {
-    pub fn nest<State2>(self, state: State2) -> NestedScope<'parent, &'parent State, State2> {
-        // SAFETY: unknown
-        let shared_state = unsafe { &*(&*self.0 as *const SharedState<State>) };
+    pub fn nest<State2>(self, state: State2) -> NestedScope<'parent, State, State2> {
+        // SAFETY:
+        // 1. `shared_state` cannot outlive the returned futures.
+        // 2. futures cannot outlive `Scope` as scope will block the current runtime thread on drop.
+        // 3. We know it is pinned
+        let shared_state =
+            unsafe { Pin::new_unchecked(&*(self.0.get_ref() as *const SharedState<State>)) };
 
-        NestedScope {
+        let scope = Scope {
             aliased: SharedState {
                 group: LockGroup {
                     lock: Mutex::new(LockState {
@@ -179,26 +183,16 @@ impl<'parent, State: 'static + Sync> ScopeState<'parent, State> {
                     condvar: Condvar::new(),
                     _pinned: PhantomPinned,
                 },
-                state: ManuallyDropCell::new(StateStack(
-                    unsafe { shared_state.state.borrow().0 },
-                    state,
-                )),
+                state: ManuallyDropCell::new(NestedStack(shared_state, state)),
                 runtime: self.0.runtime.clone(),
-            },
-
-            _invariant: Invariant {
-                marker: (
-                    Covariant {
-                        marker: PhantomData,
-                    },
-                    Contravariant {
-                        marker: PhantomData,
-                    },
-                ),
             },
 
             started_locking: false,
             removed: false,
+        };
+        NestedScope {
+            scope,
+            _covariant: PhantomData,
         }
     }
 }
@@ -281,130 +275,15 @@ pin_project! {
     /// Should the scope be dropped before those tasks complete,
     /// the tasks will be [`aborted`](JoinHandle::abort) and the runtime
     /// thread will block until all tasks have dropped.
-    pub struct Scope<State: 'static> {
+    pub struct Scope<State> {
         #[pin]
         aliased: SharedState<State>,
 
         started_locking: bool,
         removed: bool,
-
     }
 
-    impl<State: 'static> PinnedDrop for Scope<State> {
-        #[inline(never)]
-        fn drop(this: Pin<&mut Self>) {
-            let this = this.project();
-            let aliased = this.aliased.as_ref();
-            *this.started_locking = true;
-
-            if *this.removed {
-                return;
-            }
-
-            // lock and drop the state.
-            let mut lock = aliased.group.lock.lock().unwrap();
-
-            lock.tasks |= CLOSED; // mark as closed.
-
-            // abort the tasks that are still in flight
-            for (_, handle) in &mut lock.cancel_list {
-                if let Some(handle) = handle.take() {
-                    handle.abort();
-                }
-            }
-
-            // wait until there are no tasks left holding the shared lock
-            if lock.tasks & SHARED_MASK != 0 {
-                lock = block_in_place(move || {
-                    loop {
-                        // set parked bit
-                        lock.tasks |= PARKED;
-
-                        // park
-                        lock = aliased.group.condvar.wait(lock).unwrap();
-
-                        // unset parked bit
-                        lock.tasks &= !PARKED;
-
-                        // exit if no more tasks are holding the shared lock
-                        if lock.tasks & SHARED_MASK == 0 {
-                            break lock;
-                        }
-                    }
-                });
-            }
-
-            lock.drop_waker();
-
-            debug_assert!(lock.cancel_list.is_empty());
-            *this.removed = true;
-
-            // SAFETY:
-            // 0 tasks means we have exclusive access to state now.
-            // and it is currently initialised.
-            unsafe { aliased.state.drop() };
-
-            drop(lock);
-        }
-    }
-}
-
-/// Zero-sized type used to mark a type as [covariant] with respect to its type
-/// parameter `T`.
-///
-/// [covariant]: https://en.wikipedia.org/wiki/Covariance_and_contravariance_(computer_science)
-///
-/// See the [module-level documentation](index.html) for more.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-struct Covariant<T: ?Sized> {
-    marker: PhantomData<fn() -> T>,
-}
-
-/// Zero-sized type used to mark a type as [contravariant] with respect to its type
-/// parameter `T`.
-///
-/// [contravariant]: https://en.wikipedia.org/wiki/Covariance_and_contravariance_(computer_science)
-///
-/// See the [module-level documentation](index.html) for more.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-struct Contravariant<T: ?Sized> {
-    marker: PhantomData<fn(T)>,
-}
-
-/// Zero-sized type used to mark a type as [invariant] with respect to its type
-/// parameter `T`.
-///
-/// [invariant]: https://en.wikipedia.org/wiki/Covariance_and_contravariance_(computer_science)
-///
-/// See the [module-level documentation](index.html) for more.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-struct Invariant<T: ?Sized> {
-    marker: (Covariant<T>, Contravariant<T>),
-}
-
-pub struct StateStack<Head, Tail>(Head, Tail);
-
-pub trait Stack {}
-
-pin_project! {
-    /// Scope represents a scope holding some values.
-    ///
-    /// [`tokio`] tasks can be spawned in the context of this scope.
-    ///
-    /// Should the scope be dropped before those tasks complete,
-    /// the tasks will be [`aborted`](JoinHandle::abort) and the runtime
-    /// thread will block until all tasks have dropped.
-    pub struct NestedScope<'parent, Head, State: 'static> {
-        #[pin]
-        aliased: SharedState<StateStack<Head, State>>,
-
-        _invariant: Invariant<ScopeState<'parent, Head>>,
-
-        started_locking: bool,
-        removed: bool,
-    }
-
-    impl<'parent, Head, State: 'static> PinnedDrop for NestedScope<'parent, Head, State> {
+    impl<State> PinnedDrop for Scope<State> {
         #[inline(never)]
         fn drop(this: Pin<&mut Self>) {
             let this = this.project();
@@ -502,6 +381,87 @@ impl<State> Future for Scope<State> {
         };
 
         Poll::Ready(state)
+    }
+}
+
+pub struct NestedStack<Parent: 'static, State>(Pin<&'static SharedState<Parent>>, State);
+
+impl<Parent: 'static, State> NestedStack<Parent, State> {
+    pub fn parent_scope(&self) -> ScopeState<'_, Parent> {
+        ScopeState(self.0)
+    }
+
+    pub fn into_inner(self) -> State {
+        self.1
+    }
+}
+
+impl<Parent: 'static, State> Deref for NestedStack<Parent, State> {
+    type Target = State;
+
+    fn deref(&self) -> &Self::Target {
+        &self.1
+    }
+}
+
+impl<Parent: 'static, State> DerefMut for NestedStack<Parent, State> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.1
+    }
+}
+
+pin_project! {
+    /// NestedScope represents a scope holding some values.
+    ///
+    /// [`tokio`] tasks can be spawned in the context of this scope.
+    ///
+    /// Should the scope be dropped before those tasks complete,
+    /// the tasks will be [`aborted`](JoinHandle::abort) and the runtime
+    /// thread will block until all tasks have dropped.
+    pub struct NestedScope<'parent, Head: 'static, State: 'static> {
+        #[pin]
+        scope: Scope<NestedStack<Head, State>>,
+        _covariant: PhantomData<&'parent Head>
+    }
+}
+
+impl<'parent, Head, State> Future for NestedScope<'parent, Head, State> {
+    type Output = State;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<State> {
+        let state = ready!(self.project().scope.poll(cx));
+        Poll::Ready(state.1)
+    }
+}
+
+impl<'parent, Head: 'static + Sync, State: 'static + Sync> NestedScope<'parent, Head, State> {
+    /// Spawns a new asynchronous task, returning a [`JoinHandle`] for it.
+    ///
+    /// The provided future will start running in the background immediately
+    /// when `spawn` is called, even if you don't await the returned
+    /// `JoinHandle`.
+    ///
+    /// Spawning a task enables the task to execute concurrently to other tasks. The
+    /// spawned task may execute on the current thread, or it may be sent to a
+    /// different thread to be executed.
+    ///
+    /// It is guaranteed that spawn will not synchronously poll the task being spawned.
+    /// This means that calling spawn while holding a lock does not pose a risk of
+    /// deadlocking with the spawned task.
+    ///
+    /// There is no guarantee that a spawned task will execute to completion.
+    /// When a runtime is shutdown, all outstanding tasks are dropped,
+    /// regardless of the lifecycle of that task.
+    ///
+    /// # Panics
+    ///
+    /// * Panics if called after **awaiting** `Scope`
+    pub fn spawn<F, R>(self: Pin<&Self>, f: F) -> JoinHandle<R>
+    where
+        F: AsyncFnOnceRef<NestedStack<Head, State>, R> + 'static,
+        R: Send + 'static,
+    {
+        self.project_ref().scope.spawn(f)
     }
 }
 

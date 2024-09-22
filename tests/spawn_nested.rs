@@ -5,26 +5,32 @@ use std::{pin::pin, sync::Mutex, task::Context};
 
 use futures_util::{task::noop_waker_ref, Future};
 
-use pin_scoped::{Scope, ScopeState};
-
-type State<'a> = ScopeState<'a, Mutex<u64>>;
+use pin_scoped::{NestedStack, Scope, ScopeState};
 
 async fn run(n: u64) -> u64 {
     let scoped = pin!(Scope::new(Mutex::new(0)));
 
     for i in 0..n {
-        scoped.as_ref().spawn(async move |state: State| {
-            // we can spawn siblings internally
-            state.spawn(async move |state: State| {
-                tokio::time::sleep(tokio::time::Duration::from_millis(20 * i)).await;
-                *state.lock().unwrap() += 1;
-                tokio::time::sleep(tokio::time::Duration::from_millis(20 * i)).await;
-            });
+        scoped
+            .as_ref()
+            .spawn(async move |state: ScopeState<Mutex<u64>>| {
+                let nested = pin!(state.nest(Mutex::new(0)));
 
-            tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
-            *state.lock().unwrap() += 1;
-            tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
-        });
+                // we can spawn new scopes internally
+                nested.as_ref().spawn(
+                    async move |state: ScopeState<NestedStack<Mutex<u64>, Mutex<u64>>>| {
+                        *state.parent_scope().lock().unwrap() += 1;
+
+                        tokio::time::sleep(tokio::time::Duration::from_millis(20 * i)).await;
+                        *state.lock().unwrap() += 1;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(20 * i)).await;
+                    },
+                );
+
+                tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
+                *state.lock().unwrap() += nested.await.into_inner().unwrap();
+                tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
+            });
     }
 
     scoped.await.into_inner().unwrap()
