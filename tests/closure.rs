@@ -1,11 +1,7 @@
 #![feature(async_closure)]
 #![cfg(not(pin_scoped_loom))]
 
-use std::{
-    pin::{pin, Pin},
-    sync::Mutex,
-    task::Context,
-};
+use std::{pin::pin, sync::Mutex, task::Context};
 
 use futures_util::{task::noop_waker_ref, Future};
 
@@ -17,7 +13,7 @@ async fn run(n: u64) -> u64 {
     for i in 0..n {
         scoped
             .as_ref()
-            .spawn(async move |state: Pin<&ScopeState<Mutex<u64>>>| {
+            .spawn(async move |state: ScopeState<Mutex<u64>>| {
                 tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
                 *state.lock().unwrap() += 1;
                 tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;

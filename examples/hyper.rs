@@ -1,7 +1,7 @@
 #![cfg(not(any(miri, pin_scoped_loom)))]
 
 use std::{
-    pin::{pin, Pin},
+    pin::pin,
     sync::{atomic::AtomicUsize, Arc},
 };
 
@@ -91,8 +91,8 @@ async fn scoped_loop(
 }
 
 struct ServerConnection(Http1Builder, TcpStream);
-impl AsyncFnOnceRef<ScopeState<State>, ()> for ServerConnection {
-    async fn call(self, state: Pin<&ScopeState<State>>) {
+impl AsyncFnOnceRef<State, ()> for ServerConnection {
+    async fn call(self, state: ScopeState<'_, State>) {
         self.handle_conn(&state).await;
     }
 }

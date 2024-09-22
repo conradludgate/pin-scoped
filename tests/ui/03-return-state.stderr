@@ -1,8 +1,8 @@
 error: lifetime may not live long enough
-  --> tests/ui/03-return-state.rs:11:82
+  --> tests/ui/03-return-state.rs:13:52
    |
-11 |     let handle = scoped.as_ref().spawn(async move |state: Pin<&ScopeState<u64>>| state);
-   |                                                               -                - ^^^^^ returning this value requires that `'1` must outlive `'2`
-   |                                                               |                |
-   |                                                               |                return type of async closure `{async closure body@$DIR/tests/ui/03-return-state.rs:11:82: 11:87}` contains a lifetime `'2`
-   |                                                               let's call the lifetime of this reference `'1`
+13 |         .spawn(async move |state: ScopeState<u64>| state);
+   |                            -----                 - ^^^^^ returning this value requires that `'1` must outlive `'2`
+   |                            |                     |
+   |                            |                     return type of async closure `{async closure body@$DIR/tests/ui/03-return-state.rs:13:52: 13:57}` contains a lifetime `'2`
+   |                            has type `ScopeState<'1, u64>`

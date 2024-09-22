@@ -1,17 +1,18 @@
 error[E0597]: `non_scoped` does not live long enough
-  --> tests/ui/01-capture-state.rs:15:31
+  --> tests/ui/01-capture-state.rs:17:20
    |
-15 |            scoped.as_ref().spawn(async |state: Pin<&ScopeState<Mutex<u64>>>| {
-   |   _________-                     ^
-   |  |_______________________________|
-16 | ||             yield_now().await;
-17 | ||             *state.lock().unwrap() += 1;
-18 | ||             *non_scoped.lock().unwrap() += 1;
-19 | ||             yield_now().await;
-20 | ||         });
-   | ||_________^- argument requires that `non_scoped` is borrowed for `'static`
-   | |__________|
-   |            borrowed value does not live long enough
+15 | /          scoped
+16 | |              .as_ref()
+17 | |              .spawn(async |state: ScopeState<Mutex<u64>>| {
+   | | ____________________^
+18 | ||                 yield_now().await;
+19 | ||                 *state.lock().unwrap() += 1;
+20 | ||                 *non_scoped.lock().unwrap() += 1;
+21 | ||                 yield_now().await;
+22 | ||             });
+   | ||_____________^- argument requires that `non_scoped` is borrowed for `'static`
+   |  |_____________|
+   |                borrowed value does not live long enough
 ...
-24 |    }
+26 |    }
    |    - `non_scoped` dropped here while still borrowed

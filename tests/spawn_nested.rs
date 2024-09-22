@@ -1,25 +1,21 @@
 #![feature(async_closure)]
 #![cfg(not(pin_scoped_loom))]
 
-use std::{
-    pin::{pin, Pin},
-    sync::Mutex,
-    task::Context,
-};
+use std::{pin::pin, sync::Mutex, task::Context};
 
 use futures_util::{task::noop_waker_ref, Future};
 
 use pin_scoped::{Scope, ScopeState};
 
-type State = ScopeState<Mutex<u64>>;
+type State<'a> = ScopeState<'a, Mutex<u64>>;
 
 async fn run(n: u64) -> u64 {
     let scoped = pin!(Scope::new(Mutex::new(0)));
 
     for i in 0..n {
-        scoped.as_ref().spawn(async move |state: Pin<&State>| {
+        scoped.as_ref().spawn(async move |state: State| {
             // we can spawn siblings internally
-            ScopeState::spawn(state, async move |state: Pin<&State>| {
+            state.spawn(async move |state: State| {
                 tokio::time::sleep(tokio::time::Duration::from_millis(20 * i)).await;
                 *state.lock().unwrap() += 1;
                 tokio::time::sleep(tokio::time::Duration::from_millis(20 * i)).await;

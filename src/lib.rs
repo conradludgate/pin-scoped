@@ -52,7 +52,7 @@ unsafe impl<T: Sync> Sync for SharedState<T> {}
 impl<State: 'static + Sync> SharedState<State> {
     fn spawn<F, R>(self: Pin<&Self>, f: F) -> JoinHandle<R>
     where
-        F: AsyncFnOnceRef<ScopeState<State>, R> + 'static,
+        F: AsyncFnOnceRef<State, R> + 'static,
         R: Send + 'static,
     {
         // acquire the shared access lock
@@ -84,15 +84,13 @@ impl<State: 'static + Sync> SharedState<State> {
         // SAFETY:
         // 1. `shared_state` cannot outlive the returned futures.
         // 2. futures cannot outlive `Scope` as scope will block the current runtime thread on drop.
-        // 3. ScopeState is transparent to SharedState
-        let shared_state =
-            unsafe { &*(&*self as *const SharedState<State> as *const ScopeState<State>) };
+        let shared_state = unsafe { &*(&*self as *const SharedState<State>) };
 
-        let future = f.call(unsafe { Pin::new_unchecked(shared_state) });
+        let future = f.call(ScopeState(unsafe { Pin::new_unchecked(shared_state) }));
 
         let inner = ScopeGuard {
             // SAFETY: shared_state is already pinned
-            group: unsafe { Pin::new_unchecked(&shared_state.0.group) },
+            group: unsafe { Pin::new_unchecked(&shared_state.group) },
             task_key,
         };
 
@@ -124,10 +122,17 @@ impl<State: 'static + Sync> SharedState<State> {
     }
 }
 
-#[repr(transparent)]
-pub struct ScopeState<State>(SharedState<State>);
+pub struct ScopeState<'a, State>(Pin<&'a SharedState<State>>);
 
-impl<State: 'static + Sync> ScopeState<State> {
+impl<'a, State> Clone for ScopeState<'a, State> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, State> Copy for ScopeState<'a, State> {}
+
+impl<State: 'static + Sync> ScopeState<'_, State> {
     /// Spawns a new asynchronous task, returning a [`JoinHandle`] for it.
     ///
     /// The provided future will start running in the background immediately
@@ -149,16 +154,16 @@ impl<State: 'static + Sync> ScopeState<State> {
     /// # Panics
     ///
     /// * Panics if called after **awaiting** or **dropping** the parent `Scope`
-    pub fn spawn<F, R>(this: Pin<&Self>, f: F) -> JoinHandle<R>
+    pub fn spawn<F, R>(self, f: F) -> JoinHandle<R>
     where
-        F: AsyncFnOnceRef<ScopeState<State>, R> + 'static,
+        F: AsyncFnOnceRef<State, R> + 'static,
         R: Send + 'static,
     {
-        unsafe { this.map_unchecked(|p| &p.0) }.spawn(f)
+        self.0.spawn(f)
     }
 }
 
-impl<State> Deref for ScopeState<State> {
+impl<State> Deref for ScopeState<'_, State> {
     type Target = State;
 
     fn deref(&self) -> &Self::Target {
@@ -399,7 +404,7 @@ impl<State: 'static + Sync> Scope<State> {
     /// * Panics if called after **awaiting** `Scope`
     pub fn spawn<F, R>(self: Pin<&Self>, f: F) -> JoinHandle<R>
     where
-        F: AsyncFnOnceRef<ScopeState<State>, R> + 'static,
+        F: AsyncFnOnceRef<State, R> + 'static,
         R: Send + 'static,
     {
         let this = self.project_ref();
@@ -513,21 +518,15 @@ impl<F: Future, S> Future for ScopedFuture<F, S> {
 
 #[cfg(all(test, not(pin_scoped_loom)))]
 mod tests {
-    use std::{
-        future::Future,
-        pin::{pin, Pin},
-        sync::Mutex,
-        task::Context,
-        time::Duration,
-    };
+    use std::{future::Future, pin::pin, sync::Mutex, task::Context, time::Duration};
 
     use futures_util::task::noop_waker_ref;
 
     use crate::{Scope, ScopeState};
 
     struct Ex(u32);
-    impl super::AsyncFnOnceRef<ScopeState<Mutex<u64>>, ()> for Ex {
-        async fn call(self, state: Pin<&ScopeState<Mutex<u64>>>) {
+    impl super::AsyncFnOnceRef<Mutex<u64>, ()> for Ex {
+        async fn call(self, state: ScopeState<'_, Mutex<u64>>) {
             let i = self.0;
             tokio::time::sleep(Duration::from_millis(10) * i).await;
             *state.lock().unwrap() += 1;

@@ -1,10 +1,11 @@
 error[E0521]: borrowed data escapes outside of closure
   --> tests/ui/02-stash-pinned-state.rs:15:13
    |
-14 |         scoped.as_ref().spawn(async move |state: Pin<&ScopeState<u64>>| {
-   |                                           -----      - let's call the lifetime of this reference `'1`
+14 |         scoped.as_ref().spawn(async move |state: ScopeState<u64>| {
+   |                                           -----
    |                                           |
    |                                           `state` is a reference that is only valid in the closure body
+   |                                           has type `ScopeState<'1, u64>`
 15 |             STASH.set(state);
    |             ^^^^^^^^^^^^^^^^
    |             |
