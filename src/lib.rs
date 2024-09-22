@@ -4,7 +4,7 @@
 use async_fn::AsyncFnOnceRef;
 use pin_project_lite::pin_project;
 use std::future::Future;
-use std::marker::PhantomPinned;
+use std::marker::{PhantomData, PhantomPinned};
 use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::task::{Context, Poll};
@@ -163,6 +163,46 @@ impl<State: 'static + Sync> ScopeState<'_, State> {
     }
 }
 
+impl<'parent, State: 'static + Sync> ScopeState<'parent, State> {
+    pub fn nest<State2>(self, state: State2) -> NestedScope<'parent, &'parent State, State2> {
+        // SAFETY: unknown
+        let shared_state = unsafe { &*(&*self.0 as *const SharedState<State>) };
+
+        NestedScope {
+            aliased: SharedState {
+                group: LockGroup {
+                    lock: Mutex::new(LockState {
+                        waker: MaybeUninit::uninit(),
+                        tasks: 0,
+                        cancel_list: SlotMap::new(),
+                    }),
+                    condvar: Condvar::new(),
+                    _pinned: PhantomPinned,
+                },
+                state: ManuallyDropCell::new(StateStack(
+                    unsafe { shared_state.state.borrow().0 },
+                    state,
+                )),
+                runtime: self.0.runtime.clone(),
+            },
+
+            _invariant: Invariant {
+                marker: (
+                    Covariant {
+                        marker: PhantomData,
+                    },
+                    Contravariant {
+                        marker: PhantomData,
+                    },
+                ),
+            },
+
+            started_locking: false,
+            removed: false,
+        }
+    }
+}
+
 impl<State> Deref for ScopeState<'_, State> {
     type Target = State;
 
@@ -251,6 +291,120 @@ pin_project! {
     }
 
     impl<State: 'static> PinnedDrop for Scope<State> {
+        #[inline(never)]
+        fn drop(this: Pin<&mut Self>) {
+            let this = this.project();
+            let aliased = this.aliased.as_ref();
+            *this.started_locking = true;
+
+            if *this.removed {
+                return;
+            }
+
+            // lock and drop the state.
+            let mut lock = aliased.group.lock.lock().unwrap();
+
+            lock.tasks |= CLOSED; // mark as closed.
+
+            // abort the tasks that are still in flight
+            for (_, handle) in &mut lock.cancel_list {
+                if let Some(handle) = handle.take() {
+                    handle.abort();
+                }
+            }
+
+            // wait until there are no tasks left holding the shared lock
+            if lock.tasks & SHARED_MASK != 0 {
+                lock = block_in_place(move || {
+                    loop {
+                        // set parked bit
+                        lock.tasks |= PARKED;
+
+                        // park
+                        lock = aliased.group.condvar.wait(lock).unwrap();
+
+                        // unset parked bit
+                        lock.tasks &= !PARKED;
+
+                        // exit if no more tasks are holding the shared lock
+                        if lock.tasks & SHARED_MASK == 0 {
+                            break lock;
+                        }
+                    }
+                });
+            }
+
+            lock.drop_waker();
+
+            debug_assert!(lock.cancel_list.is_empty());
+            *this.removed = true;
+
+            // SAFETY:
+            // 0 tasks means we have exclusive access to state now.
+            // and it is currently initialised.
+            unsafe { aliased.state.drop() };
+
+            drop(lock);
+        }
+    }
+}
+
+/// Zero-sized type used to mark a type as [covariant] with respect to its type
+/// parameter `T`.
+///
+/// [covariant]: https://en.wikipedia.org/wiki/Covariance_and_contravariance_(computer_science)
+///
+/// See the [module-level documentation](index.html) for more.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+struct Covariant<T: ?Sized> {
+    marker: PhantomData<fn() -> T>,
+}
+
+/// Zero-sized type used to mark a type as [contravariant] with respect to its type
+/// parameter `T`.
+///
+/// [contravariant]: https://en.wikipedia.org/wiki/Covariance_and_contravariance_(computer_science)
+///
+/// See the [module-level documentation](index.html) for more.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+struct Contravariant<T: ?Sized> {
+    marker: PhantomData<fn(T)>,
+}
+
+/// Zero-sized type used to mark a type as [invariant] with respect to its type
+/// parameter `T`.
+///
+/// [invariant]: https://en.wikipedia.org/wiki/Covariance_and_contravariance_(computer_science)
+///
+/// See the [module-level documentation](index.html) for more.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+struct Invariant<T: ?Sized> {
+    marker: (Covariant<T>, Contravariant<T>),
+}
+
+pub struct StateStack<Head, Tail>(Head, Tail);
+
+pub trait Stack {}
+
+pin_project! {
+    /// Scope represents a scope holding some values.
+    ///
+    /// [`tokio`] tasks can be spawned in the context of this scope.
+    ///
+    /// Should the scope be dropped before those tasks complete,
+    /// the tasks will be [`aborted`](JoinHandle::abort) and the runtime
+    /// thread will block until all tasks have dropped.
+    pub struct NestedScope<'parent, Head, State: 'static> {
+        #[pin]
+        aliased: SharedState<StateStack<Head, State>>,
+
+        _invariant: Invariant<ScopeState<'parent, Head>>,
+
+        started_locking: bool,
+        removed: bool,
+    }
+
+    impl<'parent, Head, State: 'static> PinnedDrop for NestedScope<'parent, Head, State> {
         #[inline(never)]
         fn drop(this: Pin<&mut Self>) {
             let this = this.project();
