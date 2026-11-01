@@ -215,15 +215,13 @@ struct LockGroup {
 }
 
 struct LockState {
-    /// positive for read-only tasks
-    /// [`isize::MIN`] for a single mut task
-    /// -1 for when the state is removed
+    /// Registration count in the high bits, WAKER/PARKED/CLOSED in the low bits.
     tasks: usize,
 
     /// Set when [`WAKER`] bit of `tasks` is set.
     waker: MaybeUninit<Waker>,
 
-    /// The list of currently active tasks
+    /// Active registrations. Nested scopes have no abort handle of their own.
     cancel_list: SlotMap<DefaultKey, Option<AbortHandle>>,
 }
 
@@ -260,9 +258,10 @@ impl LockState {
             // SAFETY: the waker bit was set, so this is init
             unsafe { MaybeUninit::assume_init_mut(&mut self.waker).clone_from(waker) }
         } else {
-            // set the waker bit
+            let waker = waker.clone();
+            self.waker.write(waker);
+            // Publish initialization only after cloning succeeds.
             self.tasks |= WAKER;
-            self.waker.write(waker.clone());
         }
     }
 }
@@ -275,6 +274,11 @@ pin_project! {
     /// Should the scope be dropped before those tasks complete,
     /// the tasks will be [`aborted`](JoinHandle::abort) and the runtime
     /// thread will block until all tasks have dropped.
+    ///
+    /// Early cancellation uses [`tokio::task::block_in_place`] and requires a
+    /// context supported by that function. If cancellation cleanup unwinds
+    /// before all registrations are released, the process aborts. Panics from
+    /// the owned state's destructor can unwind after cleanup has completed.
     pub struct Scope<State> {
         #[pin]
         aliased: SharedState<State>,
@@ -293,6 +297,9 @@ pin_project! {
             if *this.removed {
                 return;
             }
+            // Scope storage must remain live until all registered users have
+            // finished. Do not allow an incomplete cleanup to unwind past it.
+            let abort_on_unwind = AbortOnDrop;
 
             // lock and drop the state.
             let mut lock = aliased.group.lock.lock().unwrap();
@@ -331,6 +338,7 @@ pin_project! {
 
             debug_assert!(lock.cancel_list.is_empty());
             *this.removed = true;
+            std::mem::forget(abort_on_unwind);
 
             // SAFETY:
             // 0 tasks means we have exclusive access to state now.
@@ -423,6 +431,10 @@ pin_project! {
     /// Should the scope be dropped before those tasks complete,
     /// the tasks will be [`aborted`](JoinHandle::abort) and the runtime
     /// thread will block until all tasks have dropped.
+    ///
+    /// Cancellation has the same blocking-context and abort-on-unwind behavior
+    /// as [`Scope`]. A leaked nested scope keeps its parent registered; awaiting
+    /// or dropping that parent may then wait indefinitely.
     pub struct NestedScope<'parent, Head: 'static, State: 'static> {
         #[pin]
         scope: Scope<NestedStack<Head, State>>,
@@ -579,9 +591,19 @@ impl<State: 'static> Scope<State> {
     }
 }
 
+// The owner waits for every registration before releasing shared state. This
+// guard must outlive the future or nested state using that borrow.
 struct ScopeGuard {
     group: Pin<&'static LockGroup>,
     task_key: DefaultKey,
+}
+
+struct AbortOnDrop;
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        std::process::abort();
+    }
 }
 
 impl ScopeGuard {
