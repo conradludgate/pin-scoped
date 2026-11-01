@@ -73,44 +73,18 @@ impl<State: 'static + Sync> SharedState<State> {
         F: AsyncFnOnceRef<State, R> + 'static,
         R: Send + 'static,
     {
-        // acquire the shared access lock
-        let task_key = {
-            let mut lock = self.group.lock.lock().unwrap();
-
-            debug_assert_eq!(lock.tasks >> 3, lock.cancel_list.len());
-
-            if lock.tasks & CLOSED == CLOSED {
-                drop(lock);
-                // todo: return an error
-                panic!("scope is in a closing state.");
-            }
-
-            let Some(tasks) = lock.tasks.checked_add(SHARED) else {
-                drop(lock);
-                // takes some very strange system to achieve this.
-                panic!("number of active exceeded maximum")
-            };
-
-            lock.tasks = tasks;
-            lock.cancel_list.insert(None)
-        };
-
-        // SAFETY:
-        // state will stay valid for shared access until the returned future gets dropped.
-        let (_, ptr_guard) = unsafe { self.state.borrow() };
-
-        // SAFETY:
-        // 1. `shared_state` cannot outlive the returned futures.
-        // 2. futures cannot outlive `Scope` as scope will block the current runtime thread on drop.
+        // SAFETY: the pinned owner cannot reclaim its storage while a registration
+        // exists. Register before exposing the extended borrow to caller code;
+        // the registration stays with the future through its destruction.
         let shared_state = unsafe { &*(&*self as *const SharedState<State>) };
-
+        // SAFETY: group is structurally pinned within shared_state.
+        let inner = ScopeGuard::new(unsafe { Pin::new_unchecked(&shared_state.group) });
+        let task_key = inner.task_key;
+        // SAFETY: inner keeps the initialized state borrowed until the future is
+        // destroyed, including when constructing or spawning it unwinds.
+        let (_, ptr_guard) = unsafe { self.state.borrow() };
+        // SAFETY: shared_state is already pinned and inner protects its lifetime.
         let future = f.call(ScopeState(unsafe { Pin::new_unchecked(shared_state) }));
-
-        let inner = ScopeGuard {
-            // SAFETY: shared_state is already pinned
-            group: unsafe { Pin::new_unchecked(&shared_state.group) },
-            task_key,
-        };
 
         let handle = self.runtime.spawn(ScopedFuture {
             inner,
@@ -182,13 +156,21 @@ impl<State: 'static + Sync> ScopeState<'_, State> {
 }
 
 impl<'parent, State: 'static + Sync> ScopeState<'parent, State> {
+    /// Creates a nested scope registered with this scope.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the parent scope has begun closing.
     pub fn nest<State2>(self, state: State2) -> NestedScope<'parent, State, State2> {
-        // SAFETY:
-        // 1. `shared_state` cannot outlive the returned futures.
-        // 2. futures cannot outlive `Scope` as scope will block the current runtime thread on drop.
-        // 3. We know it is pinned
+        // SAFETY: the parent is pinned. Its owner cannot reclaim its storage
+        // while a registration exists; acquire one before returning a nested
+        // scope, and retain it in the nested state until that state is released.
         let shared_state =
             unsafe { Pin::new_unchecked(&*(self.0.get_ref() as *const SharedState<State>)) };
+        // SAFETY: group is structurally pinned within the parent. Keep its
+        // registration in the nested state, after that state's user payload, so
+        // the parent remains borrowed until all nested users have been released.
+        let parent = ScopeGuard::new(unsafe { Pin::new_unchecked(&shared_state.get_ref().group) });
 
         let scope = Scope {
             aliased: SharedState {
@@ -201,7 +183,7 @@ impl<'parent, State: 'static + Sync> ScopeState<'parent, State> {
                     condvar: Condvar::new(),
                     _pinned: PhantomPinned,
                 },
-                state: ManuallyDropCell::new(NestedStack(shared_state, state)),
+                state: ManuallyDropCell::new(NestedStack(shared_state, state, parent)),
                 runtime: self.0.runtime.clone(),
             },
 
@@ -402,7 +384,12 @@ impl<State> Future for Scope<State> {
     }
 }
 
-pub struct NestedStack<Parent: 'static, State>(Pin<&'static SharedState<Parent>>, State);
+pub struct NestedStack<Parent: 'static, State>(
+    Pin<&'static SharedState<Parent>>,
+    State,
+    // Drop after State, whose destructor may still use the enclosing scope.
+    #[allow(dead_code)] ScopeGuard,
+);
 
 impl<Parent: 'static, State> NestedStack<Parent, State> {
     pub fn parent_scope(&self) -> ScopeState<'_, Parent> {
@@ -553,6 +540,10 @@ impl<State: 'static + Sync> Scope<State> {
 }
 
 impl<State: 'static> Scope<State> {
+    /// Returns the number of active task and nested-scope registrations.
+    ///
+    /// A nested scope keeps one registration until its state is released, even
+    /// when it has no tasks of its own.
     pub fn num_tasks(self: Pin<&Self>) -> usize {
         let group = &self.aliased.group.lock;
         group.lock().unwrap().cancel_list.len()
@@ -591,6 +582,27 @@ impl<State: 'static> Scope<State> {
 struct ScopeGuard {
     group: Pin<&'static LockGroup>,
     task_key: DefaultKey,
+}
+
+impl ScopeGuard {
+    fn new(group: Pin<&'static LockGroup>) -> Self {
+        let task_key = {
+            let mut lock = group.lock.lock().unwrap();
+            debug_assert_eq!(lock.tasks >> 3, lock.cancel_list.len());
+            if lock.tasks & CLOSED != 0 {
+                drop(lock);
+                panic!("scope is in a closing state.");
+            }
+            let Some(tasks) = lock.tasks.checked_add(SHARED) else {
+                drop(lock);
+                panic!("number of active registrations exceeded maximum");
+            };
+            let key = lock.cancel_list.insert(None);
+            lock.tasks = tasks;
+            key
+        };
+        Self { group, task_key }
+    }
 }
 
 impl Drop for ScopeGuard {

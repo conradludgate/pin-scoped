@@ -69,3 +69,32 @@ async fn yield_now() {
     })
     .await
 }
+
+#[test]
+fn nested_scopes() {
+    struct Outer;
+    impl pin_scoped::async_fn::AsyncFnOnceRef<Mutex<u64>, ()> for Outer {
+        async fn call(self, state: ScopeState<'_, Mutex<u64>>) {
+            let nested = Box::pin(state.nest(()));
+            nested.as_ref().spawn(Inner);
+            nested.await;
+        }
+    }
+
+    struct Inner;
+    impl pin_scoped::async_fn::AsyncFnOnceRef<pin_scoped::NestedStack<Mutex<u64>, ()>, ()> for Inner {
+        async fn call(self, state: ScopeState<'_, pin_scoped::NestedStack<Mutex<u64>, ()>>) {
+            *state.parent_scope().lock().unwrap() += 1;
+        }
+    }
+
+    loom::model(|| {
+        let rt = Handle::current();
+        let worker = rt.spawn_worker();
+        let scope = Box::pin(Scope::with_runtime(Mutex::new(0), rt.clone()));
+        scope.as_ref().spawn(Outer);
+        assert_eq!(loom::future::block_on(scope).into_inner().unwrap(), 1);
+        rt.shutdown();
+        worker.join().unwrap();
+    });
+}
