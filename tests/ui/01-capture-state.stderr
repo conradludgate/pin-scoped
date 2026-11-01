@@ -1,18 +1,24 @@
 error[E0597]: `non_scoped` does not live long enough
-  --> tests/ui/01-capture-state.rs:17:20
-   |
-15 | /          scoped
-16 | |              .as_ref()
-17 | |              .spawn(async |state: ScopeState<Mutex<u64>>| {
-   | | ____________________^
-18 | ||                 yield_now().await;
-19 | ||                 *state.lock().unwrap() += 1;
-20 | ||                 *non_scoped.lock().unwrap() += 1;
-21 | ||                 yield_now().await;
-22 | ||             });
-   | ||_____________^- argument requires that `non_scoped` is borrowed for `'static`
-   |  |_____________|
-   |                borrowed value does not live long enough
+ --> tests/ui/01-capture-state.rs:16:20
+  |
+ 14 | /          scoped
+ 15 | |              .as_ref()
+ 16 | |              .spawn(async |state: ScopeState<Mutex<u64>>| {
+    | | ____________________^
+ 17 | ||                 yield_now().await;
+ 18 | ||                 *state.lock().unwrap() += 1;
+ 19 | ||                 *non_scoped.lock().unwrap() += 1;
+ 20 | ||                 yield_now().await;
+ 21 | ||             });
+    | ||_____________^- argument requires that `non_scoped` is borrowed for `'static`
+    |  |_____________|
+    |                borrowed value does not live long enough
 ...
-26 |    }
-   |    - `non_scoped` dropped here while still borrowed
+ 25 |    }
+    |    - `non_scoped` dropped here while still borrowed
+    |
+note: requirement that the value outlives `'static` introduced here
+   --> src/lib.rs
+    |
+    |         F: AsyncFnOnceRef<State, R> + 'static,
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^

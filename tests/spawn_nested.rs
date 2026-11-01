@@ -1,4 +1,3 @@
-#![feature(async_closure)]
 #![cfg(not(pin_scoped_loom))]
 
 use std::{

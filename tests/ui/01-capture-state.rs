@@ -1,4 +1,3 @@
-#![feature(async_closure)]
 
 use std::{pin::pin, sync::Mutex};
 use tokio::task::yield_now;
