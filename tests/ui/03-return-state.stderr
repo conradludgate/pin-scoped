@@ -1,8 +1,8 @@
 error: lifetime may not live long enough
-  --> tests/ui/03-return-state.rs:13:52
+  --> tests/ui/03-return-state.rs:12:52
    |
-13 |         .spawn(async move |state: ScopeState<u64>| state);
+12 |         .spawn(async move |state: ScopeState<u64>| state);
    |                            -----                 - ^^^^^ returning this value requires that `'1` must outlive `'2`
    |                            |                     |
-   |                            |                     return type of async closure `{async closure body@$DIR/tests/ui/03-return-state.rs:13:52: 13:57}` contains a lifetime `'2`
+   |                            |                     return type of async closure is ScopeState<'2, u64>
    |                            has type `ScopeState<'1, u64>`
