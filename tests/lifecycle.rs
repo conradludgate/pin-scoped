@@ -49,6 +49,30 @@ fn nested_registration_is_held_until_its_state_is_released() {
 }
 
 #[test]
+fn nested_registrations_are_counted_without_spawning_tasks() {
+    runtime().block_on(async {
+        let scope = Box::pin(Scope::new(()));
+        let (created, wait_created) = oneshot::channel();
+        let (release, wait_release) = oneshot::channel();
+
+        scope
+            .as_ref()
+            .spawn(async move |state: ScopeState<'_, ()>| {
+                let nested: Vec<_> = (0..64).map(|_| state.nest(())).collect();
+                created.send(()).unwrap();
+                wait_release.await.unwrap();
+                drop(nested);
+            });
+
+        wait_created.await.unwrap();
+        // One task plus 64 nested scopes, each retaining its parent registration.
+        assert_eq!(scope.as_ref().num_tasks(), 65);
+        release.send(()).unwrap();
+        scope.await;
+    });
+}
+
+#[test]
 fn setup_panic_releases_its_registration() {
     struct PanicDuringSetup;
 
