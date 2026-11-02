@@ -99,26 +99,39 @@ fn allocation_profile() {
     let (nested_create, nested_drop) = runtime.block_on(nested).unwrap();
     runtime.block_on(scope);
 
-    let (scope, task_create) = measure(|| Scope::with_runtime((), runtime.handle().clone()));
-    let scope = Box::pin(scope);
-    let (started, ready) = mpsc::channel();
-    let started = Arc::new(started);
-    let (_, task_spawn) = measure(|| {
-        for _ in 0..64 {
-            let started = started.clone();
-            scope
-                .as_ref()
-                .spawn(async move |state: ScopeState<'_, ()>| {
-                    started.send(()).unwrap();
-                    std::future::pending::<()>().await;
-                    std::hint::black_box(state);
-                });
+    for task_count in [1, 2, 3, 4, 64] {
+        let (scope, task_create) = measure(|| Scope::with_runtime((), runtime.handle().clone()));
+        let scope = Box::pin(scope);
+        let (started, ready) = mpsc::channel();
+        let started = Arc::new(started);
+        let (_, task_spawn) = measure(|| {
+            for _ in 0..task_count {
+                let started = started.clone();
+                scope
+                    .as_ref()
+                    .spawn(async move |state: ScopeState<'_, ()>| {
+                        started.send(()).unwrap();
+                        std::future::pending::<()>().await;
+                        std::hint::black_box(state);
+                    });
+            }
+        });
+        for _ in 0..task_count {
+            ready.recv().unwrap();
         }
-    });
-    for _ in 0..64 {
-        ready.recv().unwrap();
+        let (_, task_cancel) = measure(|| drop(scope));
+
+        if task_count == 1 {
+            // One Tokio task allocation and at most one cancellation-storage allocation.
+            assert!(
+                task_spawn.count <= 2,
+                "first task allocation: {task_spawn:?}"
+            );
+        }
+        assert_eq!(task_create.count, 0);
+        assert_eq!(task_cancel.count, 0);
+        eprintln!("{task_count} pending tasks create={task_create:?}, spawn={task_spawn:?}, cancel={task_cancel:?}");
     }
-    let (_, task_cancel) = measure(|| drop(scope));
 
     assert_eq!(
         empty_create.count, 0,
@@ -130,11 +143,6 @@ fn allocation_profile() {
         "nested scope allocation: {nested_create:?}"
     );
     assert_eq!(nested_drop.count, 0);
-    assert_eq!(task_cancel.count, 0);
-
     eprintln!("empty create={empty_create:?}, drop={empty_drop:?}");
     eprintln!("64 nested scopes create={nested_create:?}, drop={nested_drop:?}");
-    eprintln!(
-        "64 pending tasks create={task_create:?}, spawn={task_spawn:?}, cancel={task_cancel:?}"
-    );
 }

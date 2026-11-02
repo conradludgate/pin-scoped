@@ -628,9 +628,11 @@ impl ScopeGuard {
                 panic!("number of active registrations exceeded maximum");
             };
             let key = if cancellable {
+                // Reserve three entries plus the sentinel, matching the first insert's
+                // growth without first allocating storage for only the sentinel.
                 Some(
                     lock.cancel_list
-                        .get_or_insert_with(SlotMap::new)
+                        .get_or_insert_with(|| SlotMap::with_capacity(3))
                         .insert(None),
                 )
             } else {
