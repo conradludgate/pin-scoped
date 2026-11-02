@@ -2,6 +2,9 @@
 
 Abusing Pin for a safe, minimally compromised scoped async-task API
 
+Requires Rust 1.85 or later. CI checks all targets and doctests on this minimum;
+the full test suite, including compiler-diagnostic snapshots, runs on stable.
+
 ## Usage
 
 ```rust
