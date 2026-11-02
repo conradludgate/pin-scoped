@@ -33,7 +33,6 @@ use async_fn::AsyncFnOnceRef;
 use pin_project_lite::pin_project;
 use std::future::Future;
 use std::marker::{PhantomData, PhantomPinned};
-use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut};
 use std::task::{ready, Context, Poll};
 use std::{mem::ManuallyDrop, pin::Pin, task::Waker};
@@ -76,15 +75,13 @@ macro_rules! StackInner {
     };
 }
 
-// The waker is set
-const WAKER: usize = 0b0001;
 // The scope owner has parked the thread
-const PARKED: usize = 0b0010;
+const PARKED: usize = 0b0001;
 // The scope is closed and all tasks should stop
-const CLOSED: usize = 0b0100;
+const CLOSED: usize = 0b0010;
 
-// value of 1 task sharing the state
-const SHARED: usize = 0b1000;
+// One live task or nested-scope registration; the low bits hold the flags.
+const SHARED: usize = 0b0100;
 const SHARED_MASK: usize = !SHARED + 1;
 
 struct SharedState<State> {
@@ -126,7 +123,7 @@ impl<State: 'static + Sync> SharedState<State> {
         // fill in abort handle
         {
             let mut lock = self.group.lock.lock().unwrap();
-            debug_assert!(lock.cancel_list.as_ref().map_or(0, SlotMap::len) <= lock.tasks >> 3);
+            debug_assert!(lock.cancel_list.as_ref().map_or(0, SlotMap::len) <= lock.tasks / SHARED);
             let tasks = lock.tasks;
 
             if let Some(handle_slot) = lock
@@ -214,7 +211,7 @@ impl<'parent, State: 'static + Sync> ScopeState<'parent, State> {
             aliased: SharedState {
                 group: LockGroup {
                     lock: Mutex::new(LockState {
-                        waker: MaybeUninit::uninit(),
+                        waker: None,
                         tasks: 0,
                         cancel_list: None,
                     }),
@@ -253,11 +250,11 @@ struct LockGroup {
 }
 
 struct LockState {
-    /// Registration count in the high bits, WAKER/PARKED/CLOSED in the low bits.
+    /// Registration count in the high bits, PARKED/CLOSED in the low bits.
     tasks: usize,
 
-    /// Set when [`WAKER`] bit of `tasks` is set.
-    waker: MaybeUninit<Waker>,
+    /// Most recent waker supplied while the scope is pending.
+    waker: Option<Waker>,
 
     /// Spawned-task cancellation slots, allocated on the first task registration.
     /// Nested scopes only contribute to the registration count in tasks.
@@ -265,42 +262,11 @@ struct LockState {
 }
 
 impl LockState {
-    fn drop_waker(&mut self) {
-        // drop the waker if it's set.
-        if self.tasks & WAKER == WAKER {
-            // unset the bit
-            self.tasks &= !WAKER;
-
-            // SAFETY: the waker bit was set, so this is init
-            unsafe {
-                MaybeUninit::assume_init_drop(&mut self.waker);
-            }
-        }
-    }
-
-    fn take_waker(&mut self) -> Option<Waker> {
-        // take the waker if it's set.
-        if self.tasks & WAKER == WAKER {
-            // unset the bit
-            self.tasks &= !WAKER;
-
-            // SAFETY: the waker bit was set, so this is init
-            unsafe { Some(MaybeUninit::assume_init_read(&self.waker)) }
-        } else {
-            None
-        }
-    }
-
     fn register_waker(&mut self, waker: &Waker) {
-        // the waker is set.
-        if self.tasks & WAKER == WAKER {
-            // SAFETY: the waker bit was set, so this is init
-            unsafe { MaybeUninit::assume_init_mut(&mut self.waker).clone_from(waker) }
+        if let Some(stored) = self.waker.as_mut() {
+            stored.clone_from(waker);
         } else {
-            let waker = waker.clone();
-            self.waker.write(waker);
-            // Publish initialization only after cloning succeeds.
-            self.tasks |= WAKER;
+            self.waker = Some(waker.clone());
         }
     }
 }
@@ -375,7 +341,7 @@ pin_project! {
                 });
             }
 
-            lock.drop_waker();
+            drop(lock.waker.take());
 
             debug_assert!(lock.cancel_list.as_ref().map_or(true, SlotMap::is_empty));
             *this.removed = true;
@@ -414,7 +380,7 @@ impl<State> Future for Scope<State> {
 
             lock.tasks |= CLOSED; // mark as closed.
 
-            lock.drop_waker();
+            drop(lock.waker.take());
 
             debug_assert!(lock.cancel_list.as_ref().map_or(true, SlotMap::is_empty));
             *this.removed = true;
@@ -538,7 +504,7 @@ impl<State: 'static + Sync> Scope<State> {
             aliased: SharedState {
                 group: LockGroup {
                     lock: Mutex::new(LockState {
-                        waker: MaybeUninit::uninit(),
+                        waker: None,
                         tasks: 0,
                         cancel_list: None,
                     }),
@@ -599,7 +565,7 @@ impl<State: 'static> Scope<State> {
     /// when it has no tasks of its own.
     pub fn num_tasks(self: Pin<&Self>) -> usize {
         let group = &self.aliased.group.lock;
-        group.lock().unwrap().tasks >> 3
+        group.lock().unwrap().tasks / SHARED
     }
 
     pub fn get(self: Pin<&Self>) -> &State {
@@ -652,7 +618,7 @@ impl ScopeGuard {
     fn new(group: Pin<&'static LockGroup>, cancellable: bool) -> Self {
         let task_key = {
             let mut lock = group.lock.lock().unwrap();
-            debug_assert!(lock.cancel_list.as_ref().map_or(0, SlotMap::len) <= lock.tasks >> 3);
+            debug_assert!(lock.cancel_list.as_ref().map_or(0, SlotMap::len) <= lock.tasks / SHARED);
             if lock.tasks & CLOSED != 0 {
                 drop(lock);
                 panic!("scope is in a closing state.");
@@ -690,7 +656,7 @@ impl Drop for ScopeGuard {
                 if lock.tasks & PARKED == PARKED {
                     self.group.condvar.notify_one();
                 }
-                lock.take_waker()
+                lock.waker.take()
             } else {
                 None
             }
