@@ -3,12 +3,12 @@ name = "pin-scoped"
 version = "0.1.0"
 edition = "2021"
 description = "Scoped async tasks API"
-repository = "https://github.com/conradlugate/pin-scoped"
+repository = "https://github.com/conradludgate/pin-scoped"
 rust-version = "1.70"
 authors = ["Conrad Ludgate <conradludgate@gmail.com>"]
 categories = ["async", "concurrency"]
 keywords = ["async", "futures", "tokio", "scoped"]
-license = "MIT OR APACHE2"
+license = "MIT OR Apache-2.0"
 
 [features]
 default = []
