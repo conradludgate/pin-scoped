@@ -1,6 +1,34 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![warn(clippy::significant_drop_tightening)]
 
+//! Scoped asynchronous tasks with shared access to owned state.
+//!
+//! # Usage
+//!
+//! ```
+//! # #[tokio::main]
+//! # async fn main() {
+//! use pin_scoped::{ScopeState, TokioScope};
+//! use std::{pin::pin, sync::Mutex};
+//!
+//! let n = 8_u64;
+//! let scope = pin!(TokioScope::new(Mutex::new(0_u64)));
+//!
+//! // spawn n tasks, with a shared reference to the pinned-state only.
+//! for i in 0..n {
+//!     scope.as_ref().spawn(async move |state: ScopeState<'_, Mutex<u64>>| {
+//!         tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
+//!         *state.lock().unwrap() += 1;
+//!         tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
+//!     });
+//! }
+//!
+//! // take back ownership of the scope.
+//! let value = scope.await.into_inner().unwrap();
+//! assert_eq!(value, n);
+//! # }
+//! ```
+
 use async_fn::AsyncFnOnceRef;
 use pin_project_lite::pin_project;
 use std::future::Future;
@@ -12,6 +40,9 @@ use std::{mem::ManuallyDrop, pin::Pin, task::Waker};
 
 pub mod async_fn;
 mod sync;
+
+/// A scope using Tokio's executor.
+pub type TokioScope<State> = Scope<State>;
 
 #[cfg(pin_scoped_loom)]
 pub mod loom_rt;
