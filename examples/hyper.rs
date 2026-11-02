@@ -16,6 +16,7 @@ use hyper_util::rt::TokioIo;
 use pin_scoped::{async_fn::AsyncFnOnceRef, Scope, ScopeState};
 use tokio::{
     net::{TcpListener, TcpStream},
+    runtime::Handle,
     signal::ctrl_c,
 };
 use tokio_util::task::TaskTracker;
@@ -91,8 +92,8 @@ async fn scoped_loop(
 }
 
 struct ServerConnection(Http1Builder, TcpStream);
-impl AsyncFnOnceRef<State, ()> for ServerConnection {
-    async fn call(self, state: ScopeState<'_, State>) {
+impl AsyncFnOnceRef<State, (), Handle> for ServerConnection {
+    async fn call(self, state: ScopeState<'_, State, Handle>) {
         self.handle_conn(&state).await;
     }
 }

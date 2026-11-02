@@ -1,12 +1,13 @@
-#![cfg(not(pin_scoped_loom))]
+#![cfg(all(feature = "tokio", not(pin_scoped_loom)))]
 
 use std::{pin::pin, sync::Mutex, task::Context};
 
 use futures_util::{task::noop_waker_ref, Future};
 
 use pin_scoped::{Scope, ScopeState};
+use tokio::runtime::Handle;
 
-type State<'a> = ScopeState<'a, Mutex<u64>>;
+type State<'a> = ScopeState<'a, Mutex<u64>, Handle>;
 
 async fn run(n: u64) -> u64 {
     let scoped = pin!(Scope::new(Mutex::new(0)));

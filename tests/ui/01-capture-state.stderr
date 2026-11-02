@@ -3,7 +3,7 @@ error[E0597]: `non_scoped` does not live long enough
   |
  14 | /          scoped
  15 | |              .as_ref()
- 16 | |              .spawn(async |state: ScopeState<Mutex<u64>>| {
+ 16 | |              .spawn(async |state: ScopeState<Mutex<u64>, Handle>| {
     | | ____________________^
  17 | ||                 yield_now().await;
  18 | ||                 *state.lock().unwrap() += 1;
@@ -20,5 +20,5 @@ error[E0597]: `non_scoped` does not live long enough
 note: requirement that the value outlives `'static` introduced here
    --> src/lib.rs
     |
-    |         F: AsyncFnOnceRef<State, R> + 'static,
-    |            ^^^^^^^^^^^^^^^^^^^^^^^^
+    |         F: AsyncFnOnceRef<State, R, Rt> + 'static,
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^

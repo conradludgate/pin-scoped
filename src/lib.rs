@@ -1,6 +1,40 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![warn(clippy::significant_drop_tightening)]
 
+//! Scoped async tasks with shared access to pinned state and eventual re-ownership.
+//!
+//! # Usage
+//!
+//! This example uses the default `tokio` feature.
+//!
+//! ```
+//! # #[cfg(feature = "tokio")]
+//! # #[tokio::main]
+//! # async fn main() {
+//! use pin_scoped::{ScopeState, TokioScope};
+//! use std::{pin::pin, sync::Mutex};
+//! use tokio::runtime::Handle;
+//!
+//! let n = 8_u64;
+//! let scope = pin!(TokioScope::new(Mutex::new(0_u64)));
+//!
+//! // spawn n tasks, with a shared reference to the pinned-state only.
+//! for i in 0..n {
+//!     scope.as_ref().spawn(async move |state: ScopeState<'_, Mutex<u64>, Handle>| {
+//!         tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
+//!         *state.lock().unwrap() += 1;
+//!         tokio::time::sleep(tokio::time::Duration::from_millis(10 * i)).await;
+//!     });
+//! }
+//!
+//! // take back ownership of the scope.
+//! let value = scope.await.into_inner().unwrap();
+//! assert_eq!(value, n);
+//! # }
+//! # #[cfg(not(feature = "tokio"))]
+//! # fn main() {}
+//! ```
+
 use async_fn::AsyncFnOnceRef;
 use pin_project_lite::pin_project;
 use std::future::Future;
@@ -13,34 +47,37 @@ use std::{mem::ManuallyDrop, pin::Pin, task::Waker};
 pub mod async_fn;
 mod sync;
 
+pub mod runtime;
+pub use runtime::Runtime;
+
+/// A scope using Tokio's executor.
+#[cfg(feature = "tokio")]
+pub type TokioScope<State> = Scope<State, tokio::runtime::Handle>;
+
 #[cfg(pin_scoped_loom)]
 pub mod loom_rt;
-#[cfg(pin_scoped_loom)]
-use loom_rt::{block_in_place, AbortHandle, Handle, JoinHandle};
-
-#[cfg(not(pin_scoped_loom))]
-use tokio::{
-    runtime::Handle,
-    task::{block_in_place, AbortHandle, JoinHandle},
-};
 
 use slotmap::{DefaultKey, SlotMap};
 use sync::{Condvar, GuardPtr, ManuallyDropCell, Mutex};
 
+/// A task's view of nested scope state, from innermost to outermost.
+///
+/// Write `Stack![InnerState, OuterState; RuntimeType]`, with the runtime type
+/// after the semicolon. A single state uses `Stack![State; RuntimeType]`.
 #[macro_export]
 macro_rules! Stack {
-    [$($t:ty),* $(,)?] => {
-        $crate::ScopeState<'_, $crate::StackInner![$($t),*]>
+    [$($t:ty),+; $runtime:ty] => {
+        $crate::ScopeState<'_, $crate::StackInner![$($t),*; $runtime], $runtime>
     };
 }
 
 #[doc(hidden)]
 #[macro_export]
 macro_rules! StackInner {
-    [$t:ty $(, $rest:ty)+] => {
-        $crate::NestedStack<$crate::StackInner![$($rest),*], $t>
+    [$t:ty $(, $rest:ty)+; $runtime:ty] => {
+        $crate::NestedStack<$crate::StackInner![$($rest),*; $runtime], $t, $runtime>
     };
-    [$t:ty] => {
+    [$t:ty; $runtime:ty] => {
         $t
     };
 }
@@ -56,27 +93,31 @@ const CLOSED: usize = 0b0100;
 const SHARED: usize = 0b1000;
 const SHARED_MASK: usize = !SHARED + 1;
 
-struct SharedState<State> {
-    group: LockGroup,
+struct SharedState<State, Rt: Runtime> {
+    group: LockGroup<Rt>,
     /// initialised if and only if !scope.removed
     state: ManuallyDropCell<State>,
 
     /// runtime to spawn tasks into
-    runtime: Handle,
+    runtime: Rt,
 }
 
-unsafe impl<T: Sync> Sync for SharedState<T> {}
+// SAFETY: payload access is shared until registrations reach zero, with T: Sync.
+// The runtime is Sync by its trait bound; cancellation tokens are Send and are
+// protected by the group's mutex. State mutation requires exclusive ownership
+// after all registered futures and nested states have released their borrows.
+unsafe impl<T: Sync, Rt: Runtime> Sync for SharedState<T, Rt> {}
 
-impl<State: 'static + Sync> SharedState<State> {
-    fn spawn<F, R>(self: Pin<&Self>, f: F) -> JoinHandle<R>
+impl<State: 'static + Sync, Rt: Runtime> SharedState<State, Rt> {
+    fn spawn<F, R>(self: Pin<&Self>, f: F) -> Rt::JoinHandle<R>
     where
-        F: AsyncFnOnceRef<State, R> + 'static,
+        F: AsyncFnOnceRef<State, R, Rt> + 'static,
         R: Send + 'static,
     {
         // SAFETY: the pinned owner cannot reclaim its storage while a registration
         // exists. Register before exposing the extended borrow to caller code;
         // the registration stays with the future through its destruction.
-        let shared_state = unsafe { &*(&*self as *const SharedState<State>) };
+        let shared_state = unsafe { &*(&*self as *const SharedState<State, Rt>) };
         // SAFETY: group is structurally pinned within shared_state.
         let inner = ScopeGuard::new(unsafe { Pin::new_unchecked(&shared_state.group) });
         let task_key = inner.task_key;
@@ -86,12 +127,13 @@ impl<State: 'static + Sync> SharedState<State> {
         // SAFETY: shared_state is already pinned and inner protects its lifetime.
         let future = f.call(ScopeState(unsafe { Pin::new_unchecked(shared_state) }));
 
-        let handle = self.runtime.spawn(RuntimeFuture::new(ScopedFuture {
+        let (handle, abort) = self.runtime.spawn(RuntimeFuture::new(ScopedFuture {
             inner,
             future: ManuallyDrop::new(future),
             ptr_guard,
         }));
 
+        let mut abort = Some(abort);
         // Closing transfers the map to the owner. A spawn that finishes
         // installing after that transfer must request its own cancellation.
         let cancel = {
@@ -100,7 +142,7 @@ impl<State: 'static + Sync> SharedState<State> {
             if let Some(cancel_list) = lock.cancel_list.as_mut() {
                 debug_assert_eq!(tasks >> 3, cancel_list.len());
                 if let Some(handle_slot) = cancel_list.get_mut(task_key) {
-                    *handle_slot = Some(handle.abort_handle());
+                    *handle_slot = abort.take();
                 }
                 false
             } else {
@@ -108,66 +150,55 @@ impl<State: 'static + Sync> SharedState<State> {
             }
         };
         if cancel {
-            handle.abort();
+            self.runtime.abort(abort.unwrap());
         }
 
         handle
     }
 }
 
-pub struct ScopeState<'a, State>(Pin<&'a SharedState<State>>);
+pub struct ScopeState<'a, State, Rt: Runtime>(Pin<&'a SharedState<State, Rt>>);
 
-impl<'a, State> Clone for ScopeState<'a, State> {
+impl<'a, State, Rt: Runtime> Clone for ScopeState<'a, State, Rt> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'a, State> Copy for ScopeState<'a, State> {}
+impl<'a, State, Rt: Runtime> Copy for ScopeState<'a, State, Rt> {}
 
-impl<State: 'static + Sync> ScopeState<'_, State> {
-    /// Spawns a new asynchronous task, returning a [`JoinHandle`] for it.
+impl<State: 'static + Sync, Rt: Runtime> ScopeState<'_, State, Rt> {
+    /// Spawns a task on this scope's runtime and returns its native handle.
     ///
-    /// The provided future will start running in the background immediately
-    /// when `spawn` is called, even if you don't await the returned
-    /// `JoinHandle`.
-    ///
-    /// Spawning a task enables the task to execute concurrently to other tasks. The
-    /// spawned task may execute on the current thread, or it may be sent to a
-    /// different thread to be executed.
-    ///
-    /// It is guaranteed that spawn will not synchronously poll the task being spawned.
-    /// This means that calling spawn while holding a lock does not pose a risk of
-    /// deadlocking with the spawned task.
-    ///
-    /// There is no guarantee that a spawned task will execute to completion.
-    /// When a runtime is shutdown, all outstanding tasks are dropped,
-    /// regardless of the lifecycle of that task.
+    /// The scope tracks completion independently of the returned handle. Runtime
+    /// adapters define the handle's joining, cancellation and error behavior.
     ///
     /// # Panics
     ///
     /// * Panics if called after **awaiting** or **dropping** the parent `Scope`
-    pub fn spawn<F, R>(self, f: F) -> JoinHandle<R>
+    pub fn spawn<F, R>(self, f: F) -> Rt::JoinHandle<R>
     where
-        F: AsyncFnOnceRef<State, R> + 'static,
+        F: AsyncFnOnceRef<State, R, Rt> + 'static,
         R: Send + 'static,
     {
         self.0.spawn(f)
     }
 }
 
-impl<'parent, State: 'static + Sync> ScopeState<'parent, State> {
+impl<'parent, State: 'static + Sync, Rt: Runtime> ScopeState<'parent, State, Rt> {
     /// Creates a nested scope registered with this scope.
     ///
     /// # Panics
     ///
     /// Panics if the parent scope has begun closing.
-    pub fn nest<State2>(self, state: State2) -> NestedScope<'parent, State, State2> {
+    pub fn nest<State2>(self, state: State2) -> NestedScope<'parent, State, State2, Rt> {
+        // Clone before putting a registration into manually-dropped state.
+        let runtime = self.0.runtime.clone();
         // SAFETY: the parent is pinned. Its owner cannot reclaim its storage
         // while a registration exists; acquire one before returning a nested
         // scope, and retain it in the nested state until that state is released.
         let shared_state =
-            unsafe { Pin::new_unchecked(&*(self.0.get_ref() as *const SharedState<State>)) };
+            unsafe { Pin::new_unchecked(&*(self.0.get_ref() as *const SharedState<State, Rt>)) };
         // SAFETY: group is structurally pinned within the parent. Keep its
         // registration in the nested state, after that state's user payload, so
         // the parent remains borrowed until all nested users have been released.
@@ -185,7 +216,7 @@ impl<'parent, State: 'static + Sync> ScopeState<'parent, State> {
                     _pinned: PhantomPinned,
                 },
                 state: ManuallyDropCell::new(NestedStack(shared_state, state, parent)),
-                runtime: self.0.runtime.clone(),
+                runtime,
             },
 
             started_locking: false,
@@ -198,7 +229,7 @@ impl<'parent, State: 'static + Sync> ScopeState<'parent, State> {
     }
 }
 
-impl<State> Deref for ScopeState<'_, State> {
+impl<State, Rt: Runtime> Deref for ScopeState<'_, State, Rt> {
     type Target = State;
 
     fn deref(&self) -> &Self::Target {
@@ -207,15 +238,15 @@ impl<State> Deref for ScopeState<'_, State> {
     }
 }
 
-struct LockGroup {
-    lock: Mutex<LockState>,
+struct LockGroup<Rt: Runtime> {
+    lock: Mutex<LockState<Rt::AbortHandle>>,
     condvar: Condvar,
 
     /// mark as !Unpin since we share the state ref
     _pinned: PhantomPinned,
 }
 
-struct LockState {
+struct LockState<A> {
     /// Registration count in the high bits, WAKER/PARKED/CLOSED in the low bits.
     tasks: usize,
 
@@ -225,10 +256,10 @@ struct LockState {
     /// Active registrations, until cancellation takes ownership of the map.
     /// Once taken, tasks still counts registrations until their guards drop.
     /// Nested scopes have no abort handle of their own.
-    cancel_list: Option<SlotMap<DefaultKey, Option<AbortHandle>>>,
+    cancel_list: Option<SlotMap<DefaultKey, Option<A>>>,
 }
 
-impl LockState {
+impl<A> LockState<A> {
     fn drop_waker(&mut self) {
         // drop the waker if it's set.
         if self.tasks & WAKER == WAKER {
@@ -272,25 +303,25 @@ impl LockState {
 pin_project! {
     /// Scope represents a scope holding some values.
     ///
-    /// [`tokio`] tasks can be spawned in the context of this scope.
+    /// Tasks can be spawned on the runtime selected for this scope.
     ///
     /// Should the scope be dropped before those tasks complete,
-    /// the tasks will be [`aborted`](JoinHandle::abort) and the runtime
+    /// cancellation is requested and the runtime
     /// thread will block until all tasks have dropped.
     ///
-    /// Early cancellation uses [`tokio::task::block_in_place`] and requires a
-    /// context supported by that function. If cancellation cleanup unwinds
+    /// Early cancellation uses [`Runtime::block_in_place`] and requires a
+    /// context supported by that runtime. If cancellation cleanup unwinds
     /// before all registrations are released, the process aborts. Panics from
     /// the owned state's destructor can unwind after cleanup has completed.
-    pub struct Scope<State> {
+    pub struct Scope<State, Rt: Runtime> {
         #[pin]
-        aliased: SharedState<State>,
+        aliased: SharedState<State, Rt>,
 
         started_locking: bool,
         removed: bool,
     }
 
-    impl<State> PinnedDrop for Scope<State> {
+    impl<State, Rt: Runtime> PinnedDrop for Scope<State, Rt> {
         #[inline(never)]
         fn drop(this: Pin<&mut Self>) {
             let this = this.project();
@@ -317,7 +348,7 @@ pin_project! {
                 drop(lock);
                 for (_, handle) in cancel_list {
                     if let Some(handle) = handle {
-                        handle.abort();
+                        aliased.runtime.abort(handle);
                     }
                 }
                 lock = aliased.group.lock.lock().unwrap();
@@ -325,7 +356,7 @@ pin_project! {
 
             // wait until there are no tasks left holding the shared lock
             if lock.tasks & SHARED_MASK != 0 {
-                lock = block_in_place(move || {
+                lock = aliased.runtime.block_in_place(move || {
                     loop {
                         // set parked bit
                         lock.tasks |= PARKED;
@@ -360,7 +391,7 @@ pin_project! {
     }
 }
 
-impl<State> Future for Scope<State> {
+impl<State, Rt: Runtime> Future for Scope<State, Rt> {
     type Output = State;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<State> {
@@ -402,15 +433,15 @@ impl<State> Future for Scope<State> {
     }
 }
 
-pub struct NestedStack<Parent: 'static, State>(
-    Pin<&'static SharedState<Parent>>,
+pub struct NestedStack<Parent: 'static, State, Rt: Runtime>(
+    Pin<&'static SharedState<Parent, Rt>>,
     State,
     // Drop after State, whose destructor may still use the enclosing scope.
-    #[allow(dead_code)] ScopeGuard,
+    #[allow(dead_code)] ScopeGuard<Rt>,
 );
 
-impl<Parent: 'static, State> NestedStack<Parent, State> {
-    pub fn parent_scope(&self) -> ScopeState<'_, Parent> {
+impl<Parent: 'static, State, Rt: Runtime> NestedStack<Parent, State, Rt> {
+    pub fn parent_scope(&self) -> ScopeState<'_, Parent, Rt> {
         ScopeState(self.0)
     }
 
@@ -419,7 +450,7 @@ impl<Parent: 'static, State> NestedStack<Parent, State> {
     }
 }
 
-impl<Parent: 'static, State> Deref for NestedStack<Parent, State> {
+impl<Parent: 'static, State, Rt: Runtime> Deref for NestedStack<Parent, State, Rt> {
     type Target = State;
 
     fn deref(&self) -> &Self::Target {
@@ -427,7 +458,7 @@ impl<Parent: 'static, State> Deref for NestedStack<Parent, State> {
     }
 }
 
-impl<Parent: 'static, State> DerefMut for NestedStack<Parent, State> {
+impl<Parent: 'static, State, Rt: Runtime> DerefMut for NestedStack<Parent, State, Rt> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.1
     }
@@ -436,23 +467,23 @@ impl<Parent: 'static, State> DerefMut for NestedStack<Parent, State> {
 pin_project! {
     /// NestedScope represents a scope holding some values.
     ///
-    /// [`tokio`] tasks can be spawned in the context of this scope.
+    /// Tasks can be spawned on the runtime selected for this scope.
     ///
     /// Should the scope be dropped before those tasks complete,
-    /// the tasks will be [`aborted`](JoinHandle::abort) and the runtime
+    /// cancellation is requested and the runtime
     /// thread will block until all tasks have dropped.
     ///
     /// Cancellation has the same blocking-context and abort-on-unwind behavior
     /// as [`Scope`]. A leaked nested scope keeps its parent registered; awaiting
     /// or dropping that parent may then wait indefinitely.
-    pub struct NestedScope<'parent, Head: 'static, State: 'static> {
+    pub struct NestedScope<'parent, Head: 'static, State: 'static, Rt: Runtime> {
         #[pin]
-        scope: Scope<NestedStack<Head, State>>,
+        scope: Scope<NestedStack<Head, State, Rt>, Rt>,
         _covariant: PhantomData<&'parent Head>
     }
 }
 
-impl<'parent, Head, State> Future for NestedScope<'parent, Head, State> {
+impl<'parent, Head, State, Rt: Runtime> Future for NestedScope<'parent, Head, State, Rt> {
     type Output = State;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<State> {
@@ -461,48 +492,38 @@ impl<'parent, Head, State> Future for NestedScope<'parent, Head, State> {
     }
 }
 
-impl<'parent, Head: 'static + Sync, State: 'static + Sync> NestedScope<'parent, Head, State> {
-    /// Spawns a new asynchronous task, returning a [`JoinHandle`] for it.
+impl<'parent, Head: 'static + Sync, State: 'static + Sync, Rt: Runtime>
+    NestedScope<'parent, Head, State, Rt>
+{
+    /// Spawns a task on this scope's runtime and returns its native handle.
     ///
-    /// The provided future will start running in the background immediately
-    /// when `spawn` is called, even if you don't await the returned
-    /// `JoinHandle`.
-    ///
-    /// Spawning a task enables the task to execute concurrently to other tasks. The
-    /// spawned task may execute on the current thread, or it may be sent to a
-    /// different thread to be executed.
-    ///
-    /// It is guaranteed that spawn will not synchronously poll the task being spawned.
-    /// This means that calling spawn while holding a lock does not pose a risk of
-    /// deadlocking with the spawned task.
-    ///
-    /// There is no guarantee that a spawned task will execute to completion.
-    /// When a runtime is shutdown, all outstanding tasks are dropped,
-    /// regardless of the lifecycle of that task.
+    /// The scope tracks completion independently of the returned handle. Runtime
+    /// adapters define the handle's joining, cancellation and error behavior.
     ///
     /// # Panics
     ///
     /// * Panics if called after **awaiting** `Scope`
-    pub fn spawn<F, R>(self: Pin<&Self>, f: F) -> JoinHandle<R>
+    pub fn spawn<F, R>(self: Pin<&Self>, f: F) -> Rt::JoinHandle<R>
     where
-        F: AsyncFnOnceRef<NestedStack<Head, State>, R> + 'static,
+        F: AsyncFnOnceRef<NestedStack<Head, State, Rt>, R, Rt> + 'static,
         R: Send + 'static,
     {
         self.project_ref().scope.spawn(f)
     }
 }
 
-impl<State: 'static + Sync> Scope<State> {
+#[cfg(feature = "tokio")]
+impl<State: 'static + Sync> Scope<State, tokio::runtime::Handle> {
     /// # Panics
     ///
     /// * Panics if called from **outside** of the Tokio runtime.
     pub fn new(state: State) -> Self {
-        Self::with_runtime(state, Handle::current())
+        Self::with_runtime(state, tokio::runtime::Handle::current())
     }
 }
 
-impl<State: 'static + Sync> Scope<State> {
-    pub fn with_runtime(state: State, rt: Handle) -> Self {
+impl<State: 'static + Sync, Rt: Runtime> Scope<State, Rt> {
+    pub fn with_runtime(state: State, rt: Rt) -> Self {
         Self {
             aliased: SharedState {
                 group: LockGroup {
@@ -522,30 +543,17 @@ impl<State: 'static + Sync> Scope<State> {
         }
     }
 
-    /// Spawns a new asynchronous task, returning a [`JoinHandle`] for it.
+    /// Spawns a task on this scope's runtime and returns its native handle.
     ///
-    /// The provided future will start running in the background immediately
-    /// when `spawn` is called, even if you don't await the returned
-    /// `JoinHandle`.
-    ///
-    /// Spawning a task enables the task to execute concurrently to other tasks. The
-    /// spawned task may execute on the current thread, or it may be sent to a
-    /// different thread to be executed.
-    ///
-    /// It is guaranteed that spawn will not synchronously poll the task being spawned.
-    /// This means that calling spawn while holding a lock does not pose a risk of
-    /// deadlocking with the spawned task.
-    ///
-    /// There is no guarantee that a spawned task will execute to completion.
-    /// When a runtime is shutdown, all outstanding tasks are dropped,
-    /// regardless of the lifecycle of that task.
+    /// The scope tracks completion independently of the returned handle. Runtime
+    /// adapters define the handle's joining, cancellation and error behavior.
     ///
     /// # Panics
     ///
     /// * Panics if called after **awaiting** `Scope`
-    pub fn spawn<F, R>(self: Pin<&Self>, f: F) -> JoinHandle<R>
+    pub fn spawn<F, R>(self: Pin<&Self>, f: F) -> Rt::JoinHandle<R>
     where
-        F: AsyncFnOnceRef<State, R> + 'static,
+        F: AsyncFnOnceRef<State, R, Rt> + 'static,
         R: Send + 'static,
     {
         let this = self.project_ref();
@@ -561,7 +569,7 @@ impl<State: 'static + Sync> Scope<State> {
     }
 }
 
-impl<State: 'static> Scope<State> {
+impl<State: 'static, Rt: Runtime> Scope<State, Rt> {
     /// Returns the number of active task and nested-scope registrations.
     ///
     /// A nested scope keeps one registration until its state is released, even
@@ -603,8 +611,8 @@ impl<State: 'static> Scope<State> {
 
 // The owner waits for every registration before releasing shared state. This
 // guard must outlive the future or nested state using that borrow.
-struct ScopeGuard {
-    group: Pin<&'static LockGroup>,
+struct ScopeGuard<Rt: Runtime> {
+    group: Pin<&'static LockGroup<Rt>>,
     task_key: DefaultKey,
 }
 
@@ -616,8 +624,8 @@ impl Drop for AbortOnDrop {
     }
 }
 
-impl ScopeGuard {
-    fn new(group: Pin<&'static LockGroup>) -> Self {
+impl<Rt: Runtime> ScopeGuard<Rt> {
+    fn new(group: Pin<&'static LockGroup<Rt>>) -> Self {
         let task_key = {
             let mut lock = group.lock.lock().unwrap();
             if lock.tasks & CLOSED != 0 {
@@ -638,7 +646,7 @@ impl ScopeGuard {
     }
 }
 
-impl Drop for ScopeGuard {
+impl<Rt: Runtime> Drop for ScopeGuard<Rt> {
     fn drop(&mut self) {
         let (waker, token) = {
             let mut lock = self.group.lock.lock().unwrap();
@@ -710,14 +718,14 @@ impl<F: Future> Future for RuntimeFuture<F> {
 }
 
 pin_project! {
-    struct ScopedFuture<F, S> {
-        inner: ScopeGuard,
+    struct ScopedFuture<F, S, Rt: Runtime> {
+        inner: ScopeGuard<Rt>,
         #[pin]
         future: ManuallyDrop<F>,
         ptr_guard: GuardPtr<ManuallyDrop<S>>,
     }
 
-    impl<F, S> PinnedDrop for ScopedFuture<F, S> {
+    impl<F, S, Rt: Runtime> PinnedDrop for ScopedFuture<F, S, Rt> {
         fn drop(this: Pin<&mut Self>) {
             let this = this.project();
 
@@ -729,7 +737,7 @@ pin_project! {
     }
 }
 
-impl<F: Future, S> Future for ScopedFuture<F, S> {
+impl<F: Future, S, Rt: Runtime> Future for ScopedFuture<F, S, Rt> {
     type Output = F::Output;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -741,17 +749,18 @@ impl<F: Future, S> Future for ScopedFuture<F, S> {
     }
 }
 
-#[cfg(all(test, not(pin_scoped_loom)))]
+#[cfg(all(test, feature = "tokio", not(pin_scoped_loom)))]
 mod tests {
     use std::{future::Future, pin::pin, sync::Mutex, task::Context, time::Duration};
 
     use futures_util::task::noop_waker_ref;
 
     use crate::{Scope, ScopeState};
+    use tokio::runtime::Handle;
 
     struct Ex(u32);
-    impl super::AsyncFnOnceRef<Mutex<u64>, ()> for Ex {
-        async fn call(self, state: ScopeState<'_, Mutex<u64>>) {
+    impl super::AsyncFnOnceRef<Mutex<u64>, (), Handle> for Ex {
+        async fn call(self, state: ScopeState<'_, Mutex<u64>, Handle>) {
             let i = self.0;
             tokio::time::sleep(Duration::from_millis(10) * i).await;
             *state.lock().unwrap() += 1;

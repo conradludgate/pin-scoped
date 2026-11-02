@@ -2,6 +2,7 @@
 use std::pin::pin;
 
 use pin_scoped::{Scope, ScopeState};
+use tokio::runtime::Handle;
 
 #[tokio::main]
 async fn main() {
@@ -9,7 +10,7 @@ async fn main() {
 
     let handle = scoped
         .as_ref()
-        .spawn(async move |state: ScopeState<u64>| state.nest(1));
+        .spawn(async move |state: ScopeState<u64, Handle>| state.nest(1));
 
     let mut state = scoped.await;
     let nested_scope = handle.await.unwrap();

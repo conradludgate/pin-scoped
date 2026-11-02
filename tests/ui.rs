@@ -1,4 +1,4 @@
-#![cfg(not(any(miri, pin_scoped_loom)))]
+#![cfg(all(feature = "tokio", not(any(miri, pin_scoped_loom))))]
 
 #[test]
 fn ui() {

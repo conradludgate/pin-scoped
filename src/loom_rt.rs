@@ -7,6 +7,32 @@ use std::{
     task::Waker,
 };
 
+impl crate::Runtime for Handle {
+    type JoinHandle<R: Send + 'static> = JoinHandle<R>;
+    type AbortHandle = AbortHandle;
+
+    fn spawn<F>(&self, future: F) -> (Self::JoinHandle<F::Output>, Self::AbortHandle)
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let handle = Handle::spawn(self, future);
+        let abort = handle.abort_handle();
+        (handle, abort)
+    }
+
+    fn abort(&self, handle: Self::AbortHandle) {
+        handle.abort();
+    }
+
+    fn block_in_place<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        block_in_place(f)
+    }
+}
+
 struct AsyncChannelInner<T> {
     messages: Vec<T>,
     // waker for the recv

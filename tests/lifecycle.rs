@@ -1,4 +1,4 @@
-#![cfg(not(pin_scoped_loom))]
+#![cfg(all(feature = "tokio", not(pin_scoped_loom)))]
 
 use std::{
     future::{ready, Future},
@@ -9,8 +9,8 @@ use std::{
     },
 };
 
-use pin_scoped::{async_fn::AsyncFnOnceRef, NestedStack, Scope, ScopeState};
-use tokio::sync::oneshot;
+use pin_scoped::{async_fn::AsyncFnOnceRef, NestedStack, Scope, ScopeState, Stack};
+use tokio::{runtime::Handle, sync::oneshot};
 
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -29,7 +29,7 @@ fn nested_registration_is_held_until_its_state_is_released() {
 
         scope
             .as_ref()
-            .spawn(async move |state: ScopeState<'_, ()>| {
+            .spawn(async move |state: ScopeState<'_, (), Handle>| {
                 let nested = Box::pin(state.nest(String::from("nested state")));
                 created.send(()).unwrap();
                 wait_release.await.unwrap();
@@ -52,8 +52,8 @@ fn nested_registration_is_held_until_its_state_is_released() {
 fn setup_panic_releases_its_registration() {
     struct PanicDuringSetup;
 
-    impl AsyncFnOnceRef<(), ()> for PanicDuringSetup {
-        fn call(self, _: ScopeState<'_, ()>) -> impl Send + Future<Output = ()> {
+    impl AsyncFnOnceRef<(), (), Handle> for PanicDuringSetup {
+        fn call(self, _: ScopeState<'_, (), Handle>) -> impl Send + Future<Output = ()> {
             if std::hint::black_box(true) {
                 panic!("setup failed");
             }
@@ -83,10 +83,12 @@ fn nested_state_destructor_panic_releases_the_parent_registration() {
 
     runtime().block_on(async {
         let scope = Box::pin(Scope::new(()));
-        let handle = scope.as_ref().spawn(async |state: ScopeState<'_, ()>| {
-            let nested = Box::pin(state.nest(PanicOnDrop));
-            assert!(catch_unwind(AssertUnwindSafe(|| drop(nested))).is_err());
-        });
+        let handle = scope
+            .as_ref()
+            .spawn(async |state: ScopeState<'_, (), Handle>| {
+                let nested = Box::pin(state.nest(PanicOnDrop));
+                assert!(catch_unwind(AssertUnwindSafe(|| drop(nested))).is_err());
+            });
         handle.await.unwrap();
         assert_eq!(scope.as_ref().num_tasks(), 0);
         scope.await;
@@ -95,28 +97,30 @@ fn nested_state_destructor_panic_releases_the_parent_registration() {
 
 #[test]
 fn multiple_nested_levels_can_access_their_ancestors() {
-    type First = NestedStack<AtomicUsize, ()>;
-    type Second = NestedStack<First, ()>;
+    type First = NestedStack<AtomicUsize, (), Handle>;
+    type Second = NestedStack<First, (), Handle>;
 
     runtime().block_on(async {
         let scope = Box::pin(Scope::new(AtomicUsize::new(0)));
         scope
             .as_ref()
-            .spawn(async |state: ScopeState<'_, AtomicUsize>| {
+            .spawn(async |state: ScopeState<'_, AtomicUsize, Handle>| {
                 let first = Box::pin(state.nest(()));
-                first.as_ref().spawn(async |state: ScopeState<'_, First>| {
-                    let second = Box::pin(state.nest(()));
-                    second
-                        .as_ref()
-                        .spawn(async |state: ScopeState<'_, Second>| {
-                            tokio::task::yield_now().await;
-                            state
-                                .parent_scope()
-                                .parent_scope()
-                                .fetch_add(1, Ordering::SeqCst);
-                        });
-                    second.await;
-                });
+                first
+                    .as_ref()
+                    .spawn(async |state: ScopeState<'_, First, Handle>| {
+                        let second = Box::pin(state.nest(()));
+                        second
+                            .as_ref()
+                            .spawn(async |state: ScopeState<'_, Second, Handle>| {
+                                tokio::task::yield_now().await;
+                                state
+                                    .parent_scope()
+                                    .parent_scope()
+                                    .fetch_add(1, Ordering::SeqCst);
+                            });
+                        second.await;
+                    });
                 first.await;
             });
         assert_eq!(scope.await.into_inner(), 1);
@@ -161,16 +165,16 @@ fn multithreaded_cancellation_releases_nested_users_before_their_owners() {
     let (started, wait_started) = oneshot::channel();
     scope
         .as_ref()
-        .spawn(async move |state: ScopeState<'_, RecordDrop>| {
+        .spawn(async move |state: ScopeState<'_, RecordDrop, Handle>| {
             let nested = Box::pin(state.nest(nested));
-            nested.as_ref().spawn(
-                async move |state: ScopeState<'_, NestedStack<RecordDrop, RecordDrop>>| {
+            nested
+                .as_ref()
+                .spawn(async move |state: Stack![RecordDrop, RecordDrop; Handle]| {
                     let task = task;
                     started.send(()).unwrap();
                     std::future::pending::<()>().await;
                     std::hint::black_box((state, task));
-                },
-            );
+                });
             nested.await;
         });
 
@@ -197,8 +201,8 @@ fn cancellation_includes_a_child_still_being_spawned() {
         resume: mpsc::Receiver<()>,
         dropped: NotifyOnDrop,
     }
-    impl AsyncFnOnceRef<(), ()> for PausedSetup {
-        fn call(self, state: ScopeState<'_, ()>) -> impl Send + Future<Output = ()> {
+    impl AsyncFnOnceRef<(), (), Handle> for PausedSetup {
+        fn call(self, state: ScopeState<'_, (), Handle>) -> impl Send + Future<Output = ()> {
             self.entered.send(()).unwrap();
             self.resume.recv().unwrap();
             async move {
@@ -216,12 +220,14 @@ fn cancellation_includes_a_child_still_being_spawned() {
     let scope = Box::pin(Scope::with_runtime((), runtime.handle().clone()));
     let (closing, wait_closing) = mpsc::channel();
     let (armed, wait_armed) = mpsc::channel();
-    scope.as_ref().spawn(async move |_: ScopeState<'_, ()>| {
-        let notify = NotifyOnDrop(closing);
-        armed.send(()).unwrap();
-        std::future::pending::<()>().await;
-        drop(notify);
-    });
+    scope
+        .as_ref()
+        .spawn(async move |_: ScopeState<'_, (), Handle>| {
+            let notify = NotifyOnDrop(closing);
+            armed.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(notify);
+        });
     wait_armed.recv().unwrap();
 
     let (entered, wait_entered) = mpsc::channel();
@@ -229,7 +235,7 @@ fn cancellation_includes_a_child_still_being_spawned() {
     let (dropped, wait_dropped) = mpsc::channel();
     scope
         .as_ref()
-        .spawn(async move |state: ScopeState<'_, ()>| {
+        .spawn(async move |state: ScopeState<'_, (), Handle>| {
             state.spawn(PausedSetup {
                 entered,
                 resume: wait_resume,

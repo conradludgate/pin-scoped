@@ -1,4 +1,4 @@
-#![cfg(not(pin_scoped_loom))]
+#![cfg(all(feature = "tokio", not(pin_scoped_loom)))]
 
 use std::{
     pin::pin,
@@ -9,7 +9,10 @@ use std::{
 use futures_util::{task::noop_waker_ref, Future};
 
 use pin_scoped::{Scope, Stack};
-use tokio::time::{sleep, Duration};
+use tokio::{
+    runtime::Handle,
+    time::{sleep, Duration},
+};
 
 async fn run(n: u64) -> u64 {
     let scoped = pin!(Scope::new(Mutex::new(0)));
@@ -17,13 +20,13 @@ async fn run(n: u64) -> u64 {
     for i in 0..n {
         scoped
             .as_ref()
-            .spawn(async move |state: Stack![Mutex<u64>]| {
+            .spawn(async move |state: Stack![Mutex<u64>; Handle]| {
                 let nested = pin!(state.nest(AtomicU64::new(0)));
 
                 // we can spawn new scopes internally
                 nested
                     .as_ref()
-                    .spawn(async move |state: Stack![AtomicU64, Mutex<u64>]| {
+                    .spawn(async move |state: Stack![AtomicU64, Mutex<u64>; Handle]| {
                         *state.parent_scope().lock().unwrap() += 1;
 
                         sleep(Duration::from_millis(20 * i)).await;

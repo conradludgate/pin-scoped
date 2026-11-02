@@ -1,4 +1,4 @@
-#![cfg(not(any(miri, pin_scoped_loom)))]
+#![cfg(all(feature = "tokio", not(any(miri, pin_scoped_loom))))]
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -7,6 +7,7 @@ use std::{
 };
 
 use pin_scoped::{Scope, ScopeState};
+use tokio::runtime::Handle;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Allocations {
@@ -86,7 +87,7 @@ fn tokio_cancellation_does_not_allocate() {
             let started = started.clone();
             scope
                 .as_ref()
-                .spawn(async move |state: ScopeState<'_, ()>| {
+                .spawn(async move |state: ScopeState<'_, (), Handle>| {
                     started.send(()).unwrap();
                     std::future::pending::<()>().await;
                     std::hint::black_box(state);

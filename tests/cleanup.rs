@@ -1,8 +1,9 @@
-#![cfg(all(not(pin_scoped_loom), not(miri)))]
+#![cfg(all(feature = "tokio", not(pin_scoped_loom), not(miri)))]
 
 use std::process::Command;
 
 use pin_scoped::{Scope, ScopeState};
+use tokio::runtime::Handle;
 
 #[test]
 fn incomplete_cleanup_aborts() {
@@ -13,7 +14,7 @@ fn incomplete_cleanup_aborts() {
             .unwrap()
             .block_on(async {
                 let scope = Box::pin(Scope::new(()));
-                scope.as_ref().spawn(async |_: ScopeState<'_, ()>| {
+                scope.as_ref().spawn(async |_: ScopeState<'_, (), Handle>| {
                     std::future::pending::<()>().await;
                 });
                 drop(scope);
@@ -48,7 +49,7 @@ fn retained_nested_registration_keeps_owner_pending() {
                 let mut scope = Box::pin(Scope::new(()));
                 scope
                     .as_ref()
-                    .spawn(async |state: ScopeState<'_, ()>| {
+                    .spawn(async |state: ScopeState<'_, (), Handle>| {
                         std::mem::forget(state.nest(()));
                     })
                     .await

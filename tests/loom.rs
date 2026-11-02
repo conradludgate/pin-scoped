@@ -3,7 +3,7 @@
 use futures_util::task::noop_waker_ref;
 use loom::sync::Mutex;
 use pin_scoped::loom_rt::Handle;
-use pin_scoped::{Scope, ScopeState};
+use pin_scoped::{NestedStack, Scope, ScopeState};
 use std::{
     future::{poll_fn, Future},
     pin::pin,
@@ -47,8 +47,8 @@ fn dropped() {
 async fn run(n: u32, rt: Handle) -> u64 {
     let scoped = pin!(Scope::with_runtime(Mutex::new(0), rt));
     struct Ex;
-    impl pin_scoped::async_fn::AsyncFnOnceRef<Mutex<u64>, ()> for Ex {
-        async fn call(self, state: ScopeState<'_, Mutex<u64>>) {
+    impl pin_scoped::async_fn::AsyncFnOnceRef<Mutex<u64>, (), Handle> for Ex {
+        async fn call(self, state: ScopeState<'_, Mutex<u64>, Handle>) {
             yield_now().await;
             *state.lock().unwrap() += 1;
             yield_now().await;
@@ -72,9 +72,11 @@ async fn yield_now() {
 
 #[test]
 fn nested_scopes() {
+    type InnerState = NestedStack<Mutex<u64>, (), Handle>;
+
     struct Outer;
-    impl pin_scoped::async_fn::AsyncFnOnceRef<Mutex<u64>, ()> for Outer {
-        async fn call(self, state: ScopeState<'_, Mutex<u64>>) {
+    impl pin_scoped::async_fn::AsyncFnOnceRef<Mutex<u64>, (), Handle> for Outer {
+        async fn call(self, state: ScopeState<'_, Mutex<u64>, Handle>) {
             let nested = Box::pin(state.nest(()));
             nested.as_ref().spawn(Inner);
             nested.await;
@@ -82,8 +84,8 @@ fn nested_scopes() {
     }
 
     struct Inner;
-    impl pin_scoped::async_fn::AsyncFnOnceRef<pin_scoped::NestedStack<Mutex<u64>, ()>, ()> for Inner {
-        async fn call(self, state: ScopeState<'_, pin_scoped::NestedStack<Mutex<u64>, ()>>) {
+    impl pin_scoped::async_fn::AsyncFnOnceRef<InnerState, (), Handle> for Inner {
+        async fn call(self, state: ScopeState<'_, InnerState, Handle>) {
             *state.parent_scope().lock().unwrap() += 1;
         }
     }

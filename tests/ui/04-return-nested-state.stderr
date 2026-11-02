@@ -1,8 +1,8 @@
 error: lifetime may not live long enough
-  --> tests/ui/04-return-nested-state.rs:12:52
+  --> tests/ui/04-return-nested-state.rs:13:60
    |
-12 |         .spawn(async move |state: ScopeState<u64>| state.nest(1));
-   |                            -----                 - ^^^^^^^^^^^^^ returning this value requires that `'1` must outlive `'2`
-   |                            |                     |
-   |                            |                     return type of async closure is NestedScope<'2, u64, i32>
-   |                            has type `ScopeState<'1, u64>`
+13 |         .spawn(async move |state: ScopeState<u64, Handle>| state.nest(1));
+   |                            -----                         - ^^^^^^^^^^^^^ returning this value requires that `'1` must outlive `'2`
+   |                            |                             |
+   |                            |                             return type of async closure is NestedScope<'2, u64, i32, Handle>
+   |                            has type `ScopeState<'1, u64, Handle>`
