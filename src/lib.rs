@@ -86,28 +86,29 @@ impl<State: 'static + Sync> SharedState<State> {
         // SAFETY: shared_state is already pinned and inner protects its lifetime.
         let future = f.call(ScopeState(unsafe { Pin::new_unchecked(shared_state) }));
 
-        let handle = self.runtime.spawn(ScopedFuture {
+        let handle = self.runtime.spawn(RuntimeFuture::new(ScopedFuture {
             inner,
             future: ManuallyDrop::new(future),
             ptr_guard,
-        });
+        }));
 
-        // fill in abort handle
-        {
+        // Closing transfers the map to the owner. A spawn that finishes
+        // installing after that transfer must request its own cancellation.
+        let cancel = {
             let mut lock = self.group.lock.lock().unwrap();
-            debug_assert_eq!(lock.tasks >> 3, lock.cancel_list.len());
             let tasks = lock.tasks;
-
-            if let Some(handle_slot) = lock.cancel_list.get_mut(task_key) {
-                if tasks & CLOSED == CLOSED {
-                    // if we are now closed, pre-emptively abort the new task.
-                    handle.abort();
-                } else {
+            if let Some(cancel_list) = lock.cancel_list.as_mut() {
+                debug_assert_eq!(tasks >> 3, cancel_list.len());
+                if let Some(handle_slot) = cancel_list.get_mut(task_key) {
                     *handle_slot = Some(handle.abort_handle());
                 }
+                false
+            } else {
+                true
             }
-
-            drop(lock);
+        };
+        if cancel {
+            handle.abort();
         }
 
         handle
@@ -178,7 +179,7 @@ impl<'parent, State: 'static + Sync> ScopeState<'parent, State> {
                     lock: Mutex::new(LockState {
                         waker: MaybeUninit::uninit(),
                         tasks: 0,
-                        cancel_list: SlotMap::new(),
+                        cancel_list: Some(SlotMap::new()),
                     }),
                     condvar: Condvar::new(),
                     _pinned: PhantomPinned,
@@ -221,8 +222,10 @@ struct LockState {
     /// Set when [`WAKER`] bit of `tasks` is set.
     waker: MaybeUninit<Waker>,
 
-    /// Active registrations. Nested scopes have no abort handle of their own.
-    cancel_list: SlotMap<DefaultKey, Option<AbortHandle>>,
+    /// Active registrations, until cancellation takes ownership of the map.
+    /// Once taken, tasks still counts registrations until their guards drop.
+    /// Nested scopes have no abort handle of their own.
+    cancel_list: Option<SlotMap<DefaultKey, Option<AbortHandle>>>,
 }
 
 impl LockState {
@@ -306,11 +309,18 @@ pin_project! {
 
             lock.tasks |= CLOSED; // mark as closed.
 
-            // abort the tasks that are still in flight
-            for (_, handle) in &mut lock.cancel_list {
-                if let Some(handle) = handle.take() {
-                    handle.abort();
+            if lock.tasks & SHARED_MASK != 0 {
+                // Move the existing allocation out before cancellation. Guards
+                // continue releasing registrations through tasks, and late spawns
+                // cancel themselves when they find that the map has been taken.
+                let cancel_list = lock.cancel_list.take().unwrap();
+                drop(lock);
+                for (_, handle) in cancel_list {
+                    if let Some(handle) = handle {
+                        handle.abort();
+                    }
                 }
+                lock = aliased.group.lock.lock().unwrap();
             }
 
             // wait until there are no tasks left holding the shared lock
@@ -336,7 +346,7 @@ pin_project! {
 
             lock.drop_waker();
 
-            debug_assert!(lock.cancel_list.is_empty());
+            debug_assert!(lock.cancel_list.as_ref().map_or(true, SlotMap::is_empty));
             *this.removed = true;
             std::mem::forget(abort_on_unwind);
 
@@ -375,7 +385,7 @@ impl<State> Future for Scope<State> {
 
             lock.drop_waker();
 
-            debug_assert!(lock.cancel_list.is_empty());
+            debug_assert!(lock.cancel_list.as_ref().map_or(true, SlotMap::is_empty));
             *this.removed = true;
 
             // SAFETY:
@@ -499,7 +509,7 @@ impl<State: 'static + Sync> Scope<State> {
                     lock: Mutex::new(LockState {
                         waker: MaybeUninit::uninit(),
                         tasks: 0,
-                        cancel_list: SlotMap::new(),
+                        cancel_list: Some(SlotMap::new()),
                     }),
                     condvar: Condvar::new(),
                     _pinned: PhantomPinned,
@@ -558,7 +568,7 @@ impl<State: 'static> Scope<State> {
     /// when it has no tasks of its own.
     pub fn num_tasks(self: Pin<&Self>) -> usize {
         let group = &self.aliased.group.lock;
-        group.lock().unwrap().cancel_list.len()
+        group.lock().unwrap().tasks >> 3
     }
 
     pub fn get(self: Pin<&Self>) -> &State {
@@ -583,7 +593,7 @@ impl<State: 'static> Scope<State> {
             return Poll::Pending;
         }
 
-        debug_assert!(lock.cancel_list.is_empty());
+        debug_assert!(lock.cancel_list.as_ref().map_or(true, SlotMap::is_empty));
 
         drop(lock);
 
@@ -610,7 +620,6 @@ impl ScopeGuard {
     fn new(group: Pin<&'static LockGroup>) -> Self {
         let task_key = {
             let mut lock = group.lock.lock().unwrap();
-            debug_assert_eq!(lock.tasks >> 3, lock.cancel_list.len());
             if lock.tasks & CLOSED != 0 {
                 drop(lock);
                 panic!("scope is in a closing state.");
@@ -619,7 +628,9 @@ impl ScopeGuard {
                 drop(lock);
                 panic!("number of active registrations exceeded maximum");
             };
-            let key = lock.cancel_list.insert(None);
+            let cancel_list = lock.cancel_list.as_mut().unwrap();
+            debug_assert_eq!((tasks >> 3) - 1, cancel_list.len());
+            let key = cancel_list.insert(None);
             lock.tasks = tasks;
             key
         };
@@ -629,24 +640,72 @@ impl ScopeGuard {
 
 impl Drop for ScopeGuard {
     fn drop(&mut self) {
-        let waker = {
+        let (waker, token) = {
             let mut lock = self.group.lock.lock().unwrap();
-            lock.cancel_list.remove(self.task_key);
+            let token = lock
+                .cancel_list
+                .as_mut()
+                .and_then(|cancel_list| cancel_list.remove(self.task_key));
 
             lock.tasks -= SHARED;
-            if lock.tasks & SHARED_MASK == 0 {
+            let waker = if lock.tasks & SHARED_MASK == 0 {
                 if lock.tasks & PARKED == PARKED {
                     self.group.condvar.notify_one();
                 }
                 lock.take_waker()
             } else {
                 None
-            }
+            };
+            (waker, token)
         };
 
         if let Some(waker) = waker {
             waker.wake();
         }
+        drop(token);
+    }
+}
+
+// Keep reference-bearing task state behind an initialization boundary when
+// ownership crosses executor code. The executor only pins/polls/drops this
+// wrapper; access to the initialized inner future stays local to these methods.
+pin_project! {
+    struct RuntimeFuture<F> {
+        #[pin]
+        inner: MaybeUninit<F>,
+    }
+
+    impl<F> PinnedDrop for RuntimeFuture<F> {
+        fn drop(this: Pin<&mut Self>) {
+            // SAFETY: new initializes inner once. Polling only borrows it, and
+            // this private wrapper never extracts or replaces it. Destruction
+            // occurs in place; MaybeUninit does not subsequently drop F again.
+            unsafe { this.project().inner.get_unchecked_mut().assume_init_drop() };
+        }
+    }
+}
+
+impl<F> RuntimeFuture<F> {
+    fn new(future: F) -> Self {
+        Self {
+            inner: MaybeUninit::new(future),
+        }
+    }
+}
+
+impl<F: Future> Future for RuntimeFuture<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: inner is initialized by new and stays initialized until
+        // PinnedDrop. It is structurally pinned, never moved after pinning, and
+        // destroyed in place, so projecting to the initialized F preserves Pin.
+        unsafe {
+            self.project()
+                .inner
+                .map_unchecked_mut(|inner| inner.assume_init_mut())
+        }
+        .poll(cx)
     }
 }
 

@@ -180,3 +180,72 @@ fn multithreaded_cancellation_releases_nested_users_before_their_owners() {
     assert_eq!(nested_position.load(Ordering::SeqCst), 2);
     assert_eq!(owner_position.load(Ordering::SeqCst), 3);
 }
+
+#[test]
+fn cancellation_includes_a_child_still_being_spawned() {
+    use std::{sync::mpsc, thread};
+
+    struct NotifyOnDrop(mpsc::Sender<()>);
+    impl Drop for NotifyOnDrop {
+        fn drop(&mut self) {
+            self.0.send(()).unwrap();
+        }
+    }
+
+    struct PausedSetup {
+        entered: mpsc::Sender<()>,
+        resume: mpsc::Receiver<()>,
+        dropped: NotifyOnDrop,
+    }
+    impl AsyncFnOnceRef<(), ()> for PausedSetup {
+        fn call(self, state: ScopeState<'_, ()>) -> impl Send + Future<Output = ()> {
+            self.entered.send(()).unwrap();
+            self.resume.recv().unwrap();
+            async move {
+                let dropped = self.dropped;
+                std::future::pending::<()>().await;
+                std::hint::black_box((state, dropped));
+            }
+        }
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    let scope = Box::pin(Scope::with_runtime((), runtime.handle().clone()));
+    let (closing, wait_closing) = mpsc::channel();
+    let (armed, wait_armed) = mpsc::channel();
+    scope.as_ref().spawn(async move |_: ScopeState<'_, ()>| {
+        let notify = NotifyOnDrop(closing);
+        armed.send(()).unwrap();
+        std::future::pending::<()>().await;
+        drop(notify);
+    });
+    wait_armed.recv().unwrap();
+
+    let (entered, wait_entered) = mpsc::channel();
+    let (resume, wait_resume) = mpsc::channel();
+    let (dropped, wait_dropped) = mpsc::channel();
+    scope
+        .as_ref()
+        .spawn(async move |state: ScopeState<'_, ()>| {
+            state.spawn(PausedSetup {
+                entered,
+                resume: wait_resume,
+                dropped: NotifyOnDrop(dropped),
+            });
+        });
+    wait_entered.recv().unwrap();
+    assert_eq!(scope.as_ref().num_tasks(), 3);
+
+    let release = thread::spawn(move || {
+        // The notifier's destruction establishes that cancellation has started
+        // before the child's spawn is allowed to return.
+        wait_closing.recv().unwrap();
+        resume.send(()).unwrap();
+    });
+    drop(scope);
+    wait_dropped.recv().unwrap();
+    release.join().unwrap();
+}
