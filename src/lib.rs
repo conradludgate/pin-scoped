@@ -109,8 +109,8 @@ impl<State: 'static + Sync> SharedState<State> {
         // the registration stays with the future through its destruction.
         let shared_state = unsafe { &*(&*self as *const SharedState<State>) };
         // SAFETY: group is structurally pinned within shared_state.
-        let inner = ScopeGuard::new(unsafe { Pin::new_unchecked(&shared_state.group) });
-        let task_key = inner.task_key;
+        let inner = ScopeGuard::new(unsafe { Pin::new_unchecked(&shared_state.group) }, true);
+        let task_key = inner.task_key.unwrap();
         // SAFETY: inner keeps the initialized state borrowed until the future is
         // destroyed, including when constructing or spawning it unwinds.
         let (_, ptr_guard) = unsafe { self.state.borrow() };
@@ -126,10 +126,14 @@ impl<State: 'static + Sync> SharedState<State> {
         // fill in abort handle
         {
             let mut lock = self.group.lock.lock().unwrap();
-            debug_assert_eq!(lock.tasks >> 3, lock.cancel_list.len());
+            debug_assert!(lock.cancel_list.as_ref().map_or(0, SlotMap::len) <= lock.tasks >> 3);
             let tasks = lock.tasks;
 
-            if let Some(handle_slot) = lock.cancel_list.get_mut(task_key) {
+            if let Some(handle_slot) = lock
+                .cancel_list
+                .as_mut()
+                .and_then(|list| list.get_mut(task_key))
+            {
                 if tasks & CLOSED == CLOSED {
                     // if we are now closed, pre-emptively abort the new task.
                     handle.abort();
@@ -201,7 +205,10 @@ impl<'parent, State: 'static + Sync> ScopeState<'parent, State> {
         // SAFETY: group is structurally pinned within the parent. Keep its
         // registration in the nested state, after that state's user payload, so
         // the parent remains borrowed until all nested users have been released.
-        let parent = ScopeGuard::new(unsafe { Pin::new_unchecked(&shared_state.get_ref().group) });
+        let parent = ScopeGuard::new(
+            unsafe { Pin::new_unchecked(&shared_state.get_ref().group) },
+            false,
+        );
 
         let scope = Scope {
             aliased: SharedState {
@@ -209,7 +216,7 @@ impl<'parent, State: 'static + Sync> ScopeState<'parent, State> {
                     lock: Mutex::new(LockState {
                         waker: MaybeUninit::uninit(),
                         tasks: 0,
-                        cancel_list: SlotMap::new(),
+                        cancel_list: None,
                     }),
                     condvar: Condvar::new(),
                     _pinned: PhantomPinned,
@@ -252,8 +259,9 @@ struct LockState {
     /// Set when [`WAKER`] bit of `tasks` is set.
     waker: MaybeUninit<Waker>,
 
-    /// Active registrations. Nested scopes have no abort handle of their own.
-    cancel_list: SlotMap<DefaultKey, Option<AbortHandle>>,
+    /// Spawned-task cancellation slots, allocated on the first task registration.
+    /// Nested scopes only contribute to the registration count in tasks.
+    cancel_list: Option<SlotMap<DefaultKey, Option<AbortHandle>>>,
 }
 
 impl LockState {
@@ -338,9 +346,11 @@ pin_project! {
             lock.tasks |= CLOSED; // mark as closed.
 
             // abort the tasks that are still in flight
-            for (_, handle) in &mut lock.cancel_list {
-                if let Some(handle) = handle.take() {
-                    handle.abort();
+            if let Some(cancel_list) = lock.cancel_list.as_mut() {
+                for (_, handle) in cancel_list {
+                    if let Some(handle) = handle.take() {
+                        handle.abort();
+                    }
                 }
             }
 
@@ -367,7 +377,7 @@ pin_project! {
 
             lock.drop_waker();
 
-            debug_assert!(lock.cancel_list.is_empty());
+            debug_assert!(lock.cancel_list.as_ref().map_or(true, SlotMap::is_empty));
             *this.removed = true;
             std::mem::forget(abort_on_unwind);
 
@@ -406,7 +416,7 @@ impl<State> Future for Scope<State> {
 
             lock.drop_waker();
 
-            debug_assert!(lock.cancel_list.is_empty());
+            debug_assert!(lock.cancel_list.as_ref().map_or(true, SlotMap::is_empty));
             *this.removed = true;
 
             // SAFETY:
@@ -530,7 +540,7 @@ impl<State: 'static + Sync> Scope<State> {
                     lock: Mutex::new(LockState {
                         waker: MaybeUninit::uninit(),
                         tasks: 0,
-                        cancel_list: SlotMap::new(),
+                        cancel_list: None,
                     }),
                     condvar: Condvar::new(),
                     _pinned: PhantomPinned,
@@ -589,7 +599,7 @@ impl<State: 'static> Scope<State> {
     /// when it has no tasks of its own.
     pub fn num_tasks(self: Pin<&Self>) -> usize {
         let group = &self.aliased.group.lock;
-        group.lock().unwrap().cancel_list.len()
+        group.lock().unwrap().tasks >> 3
     }
 
     pub fn get(self: Pin<&Self>) -> &State {
@@ -614,7 +624,7 @@ impl<State: 'static> Scope<State> {
             return Poll::Pending;
         }
 
-        debug_assert!(lock.cancel_list.is_empty());
+        debug_assert!(lock.cancel_list.as_ref().map_or(true, SlotMap::is_empty));
 
         drop(lock);
 
@@ -626,7 +636,8 @@ impl<State: 'static> Scope<State> {
 // guard must outlive the future or nested state using that borrow.
 struct ScopeGuard {
     group: Pin<&'static LockGroup>,
-    task_key: DefaultKey,
+    // None for nested scopes, which keep a registration but have no abort handle.
+    task_key: Option<DefaultKey>,
 }
 
 struct AbortOnDrop;
@@ -638,10 +649,10 @@ impl Drop for AbortOnDrop {
 }
 
 impl ScopeGuard {
-    fn new(group: Pin<&'static LockGroup>) -> Self {
+    fn new(group: Pin<&'static LockGroup>, cancellable: bool) -> Self {
         let task_key = {
             let mut lock = group.lock.lock().unwrap();
-            debug_assert_eq!(lock.tasks >> 3, lock.cancel_list.len());
+            debug_assert!(lock.cancel_list.as_ref().map_or(0, SlotMap::len) <= lock.tasks >> 3);
             if lock.tasks & CLOSED != 0 {
                 drop(lock);
                 panic!("scope is in a closing state.");
@@ -650,7 +661,15 @@ impl ScopeGuard {
                 drop(lock);
                 panic!("number of active registrations exceeded maximum");
             };
-            let key = lock.cancel_list.insert(None);
+            let key = if cancellable {
+                Some(
+                    lock.cancel_list
+                        .get_or_insert_with(SlotMap::new)
+                        .insert(None),
+                )
+            } else {
+                None
+            };
             lock.tasks = tasks;
             key
         };
@@ -662,7 +681,9 @@ impl Drop for ScopeGuard {
     fn drop(&mut self) {
         let waker = {
             let mut lock = self.group.lock.lock().unwrap();
-            lock.cancel_list.remove(self.task_key);
+            if let Some(task_key) = self.task_key {
+                lock.cancel_list.as_mut().unwrap().remove(task_key);
+            }
 
             lock.tasks -= SHARED;
             if lock.tasks & SHARED_MASK == 0 {
